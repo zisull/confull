@@ -9,6 +9,7 @@ from collections.abc import MutableMapping
 from threading import Lock
 import hashlib
 import base64
+import hmac
 
 import orjson
 import toml
@@ -16,6 +17,7 @@ import yaml
 
 ENCRYPT_HEADER = b'CONFULLENC:'
 MD5_SIZE = 32  # 32字节的十六进制MD5字符串
+HMAC_SIZE = 64  # SHA256 HMAC的十六进制摘要长度
 
 class Config:
     """
@@ -71,7 +73,7 @@ class Config:
 
     def _encrypt_data(self, data):
         """
-        简单加密数据，使用盐值增强安全性，并加上MD5摘要。
+        简单加密数据，使用盐值增强安全性，并加上HMAC-SHA256摘要。
         :param data: 要加密的数据
         :return: 加密后的数据
         """
@@ -79,28 +81,31 @@ class Config:
             return data
         # 将数据转换为JSON字符串
         json_data = orjson.dumps(data)
-        # 计算MD5摘要（十六进制字符串，32字节）
-        md5_digest = hashlib.md5(json_data).hexdigest().encode()
+        
         # 简单异或加密
         encrypted = bytearray()
         for i, byte in enumerate(json_data):
             encrypted.append(byte ^ self._key[i % len(self._key)])
+        
+        # 使用密钥和盐值派生HMAC密钥
+        hmac_key = hashlib.sha256(self._key + self._salt).digest()
+        # 计算HMAC摘要
+        hmac_digest = hmac.new(hmac_key, bytes(encrypted), hashlib.sha256).hexdigest().encode()
+
         # 盐值(8字节) + 加密数据
         result = self._salt + bytes(encrypted)
-        # 返回带标记和MD5的加密数据
-        return ENCRYPT_HEADER + md5_digest + base64.b64encode(result)
+        # 返回带标记和HMAC的加密数据
+        return ENCRYPT_HEADER + hmac_digest + base64.b64encode(result)
 
     def _decrypt_data(self, encrypted_data):
         """
-        解密数据，校验MD5摘要。
+        解密数据，校验HMAC-SHA256摘要。
         :param encrypted_data: 加密的数据
         :return: 解密后的数据
         """
-        if not self._key:
-            return encrypted_data
         if not self._pwd:
-            print("解密时密码不能为空")
-            return {}
+            raise ValueError("解密时需要提供密码。")
+
         # 判断是否有加密头
         if not encrypted_data.startswith(ENCRYPT_HEADER):
             # 不是加密内容，直接返回原数据
@@ -108,28 +113,32 @@ class Config:
         try:
             # 去除加密头
             encrypted_data = encrypted_data[len(ENCRYPT_HEADER):]
-            # 取出MD5摘要
-            md5_digest = encrypted_data[:MD5_SIZE]
-            encrypted_data = encrypted_data[MD5_SIZE:]
+            # 取出HMAC摘要
+            hmac_digest = encrypted_data[:HMAC_SIZE]
+            encrypted_data = encrypted_data[HMAC_SIZE:]
             # 解码base64
             data = base64.b64decode(encrypted_data)
             # 提取盐值
-            self._salt = data[:8]
+            salt = data[:8]
             encrypted_bytes = data[8:]
             # 重新生成密钥
-            self._key = hashlib.sha256(self._pwd.encode() + self._salt).digest()
+            key = hashlib.sha256(self._pwd.encode() + salt).digest()
+
+            # 使用重新生成的密钥和盐值派生HMAC密钥
+            hmac_key = hashlib.sha256(key + salt).digest()
+            # 校验HMAC
+            calc_hmac = hmac.new(hmac_key, encrypted_bytes, hashlib.sha256).hexdigest().encode()
+            if not hmac.compare_digest(calc_hmac, hmac_digest):
+                raise ValueError("HMAC校验失败，可能是密码错误或数据损坏。")
+            
             # 解密数据
             decrypted = bytearray()
             for i, byte in enumerate(encrypted_bytes):
-                decrypted.append(byte ^ self._key[i % len(self._key)])
-            # 校验MD5
-            calc_md5 = hashlib.md5(bytes(decrypted)).hexdigest().encode()
-            if calc_md5 != md5_digest:
-                raise ValueError("解密后MD5校验失败，可能是密码错误或数据损坏。")
+                decrypted.append(byte ^ key[i % len(key)])
+            
             return orjson.loads(bytes(decrypted))
         except Exception as e:
-            print(f"解密数据失败（可能是密码错误或数据损坏）：{e}")
-            return {}
+            raise ValueError(f"解密失败: {e}") from e
 
     @property
     def json(self):
@@ -346,46 +355,21 @@ class Config:
             if not self._dirty:
                 return
             try:
-                # 写入前校验：如果文件存在且为加密文件，校验头和MD5
+                # 写入前校验：如果文件存在且为加密文件，进行校验
                 if os.path.exists(self._file):
                     with open(self._file, 'rb') as f:
-                        raw = f.read()
-                        if raw.startswith(ENCRYPT_HEADER):
-                            # 取出MD5摘要
-                            md5_digest = raw[len(ENCRYPT_HEADER):len(ENCRYPT_HEADER)+MD5_SIZE]
-                            encrypted_data = raw[len(ENCRYPT_HEADER)+MD5_SIZE:]
+                        # 只读取头部来判断是否加密，避免读取整个大文件
+                        header = f.read(len(ENCRYPT_HEADER))
+                        if header == ENCRYPT_HEADER:
+                            f.seek(0)  # 重置文件指针
+                            raw_content = f.read()
                             try:
-                                data = base64.b64decode(encrypted_data)
-                                salt = data[:8]
-                                encrypted_bytes = data[8:]
-                                if not self._key:
-                                    raise ValueError('加密文件校验失败：未提供密码，拒绝写入！')
-                                key = hashlib.sha256(self._pwd.encode() + salt).digest()
-                                decrypted = bytearray()
-                                for i, byte in enumerate(encrypted_bytes):
-                                    decrypted.append(byte ^ key[i % len(key)])
-                                calc_md5 = hashlib.md5(bytes(decrypted)).hexdigest().encode()
-                                if md5_digest is None:
-                                    raise ValueError('加密文件校验失败（摘要缺失），拒绝写入！')
-                                if not isinstance(md5_digest, bytes):
-                                    raise ValueError('加密文件校验失败（摘要类型错误），拒绝写入！')
-                                if calc_md5 != md5_digest:
-                                    raise ValueError('加密文件校验失败（密码错误或数据损坏），拒绝写入！')
+                                # 复用解密逻辑进行校验，如果失败会抛出异常
+                                self._decrypt_data(raw_content)
                             except Exception as e:
                                 raise ValueError(f'加密文件校验失败，拒绝写入！原因：{e}')
-                self._ensure_file_exists()
-                # 获取配置数据
-                config_data = self._data.to_dict()
-                # 如果设置了密码，先加密
-                if self._key:
-                    encrypted_data = self._encrypt_data(config_data)
-                    with open(self._file, 'wb') as f:
-                        f.write(encrypted_data)
-                else:
-                    # 没有密码时，使用原来的方式保存
-                    with open(self._file, 'wb' if self._way in ["json", "xml"] else 'w',
-                              encoding=None if self._way in ["json", "xml"] else 'utf-8') as f:
-                        self._handler.save(config_data, f)
+
+                self._write_to_file(self._file, self._way)
                 self._dirty = False
             except Exception as e:
                 print(f"保存配置文件失败 {self._file}: {e}")
@@ -396,39 +380,52 @@ class Config:
         :param file: 目标文件
         :param way: 目标格式
         """
-        # 使用局部变量来存储文件路径和格式
         target_file = self.ensure_extension(file) if file else self._file
         target_way = self.validate_format(way) if way else self._way
-        target_handler = ConfigHandlerFactory.get_handler(target_way)
+        self._write_to_file(target_file, target_way)
+        print(f"配置已成功另存到 {target_file}")
 
-        # 确保文件存在
-        self._ensure_file_exists()
+    def _write_to_file(self, target_file, target_way):
+        """
+        将配置数据写入指定文件和格式的核心逻辑。
+        :param target_file: 目标文件路径
+        :param target_way: 目标文件格式
+        """
+        target_handler = ConfigHandlerFactory.get_handler(target_way)
+        self._ensure_file_exists(file_path=target_file)
 
         with self._lock:
             try:
-                # 获取配置数据
                 config_data = self._data.to_dict()
-                
-                # 如果设置了密码，先加密
+
                 if self._key:
                     encrypted_data = self._encrypt_data(config_data)
                     with open(target_file, 'wb') as f:
                         f.write(encrypted_data)
                 else:
-                    # 没有密码时，使用原来的方式保存
-                    with open(target_file, 'wb' if target_way == "json" else 'w',
-                              encoding=None if target_way == "json" else 'utf-8') as f:
+                    mode = 'w' + target_handler.mode
+                    encoding = 'utf-8' if 'b' not in mode else None
+                    with open(target_file, mode, encoding=encoding) as f:
                         target_handler.save(config_data, f)
-
-                print(f"配置已成功另存到 {target_file}")
             except Exception as e:
-                print(f"另存配置文件失败 {target_file}: {e}")
+                # 重新抛出异常，让调用方处理
+                raise IOError(f"写入文件 {target_file} 失败: {e}") from e
 
-    def _ensure_file_exists(self):
+    def _ensure_file_exists(self, file_path=None):
         """确保配置文件存在。"""
-        if not os.path.exists(self._file):
-            with open(self._file, 'w'):
-                pass  # 创建一个空文件
+        path = file_path if file_path else self._file
+        if not os.path.exists(path):
+            # 确保目录存在
+            dir_name = os.path.dirname(path)
+            if dir_name and not os.path.exists(dir_name):
+                try:
+                    os.makedirs(dir_name)
+                except OSError as e:
+                    # 如果目录创建失败，也意味着文件无法创建，因此重新抛出异常
+                    raise IOError(f"创建目录 {dir_name} 失败: {e}") from e
+            # 创建空文件
+            with open(path, 'w'):
+                pass
 
 
 
@@ -568,6 +565,7 @@ class ConfigHandler:
     """
     配置文件处理器基类。
     """
+    mode = 't'  # 't' for text, 'b' for binary
 
     def load(self, file):
         """加载配置文件。"""
@@ -582,6 +580,7 @@ class JSONConfigHandler(ConfigHandler):
     """
     JSON 配置文件处理器。
     """
+    mode = 'b'
 
     def load(self, file):
         """加载 JSON 配置。"""
@@ -645,6 +644,7 @@ class XMLConfigHandler(ConfigHandler):
     """
     XML 配置文件处理器。
     """
+    mode = 'b'
 
     def load(self, file):
         """加载 XML 配置。"""
@@ -764,6 +764,8 @@ class ConfigNode(MutableMapping):
             else:
                 return value
         else:
+            # 自动创建不存在的配置项，以支持链式赋值 (autovivification)
+            # 例如: cfg.new_section.new_option = 'value'
             self._data[key] = {}
             return ConfigNode(self._data[key], manager=self._manager, key_in_parent=key)
 
