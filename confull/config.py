@@ -271,67 +271,81 @@ class Config:
         if self.auto_save:
             self.save()
 
-    def del_key(self, key):
+    def del_key(self, key: str):
         """
-        删除指定配置项，支持点号路径。
+        删除指定配置项，支持点号路径，并会自动清理空的父节点。
         :param key: 配置项路径
         """
         self.mark_dirty()
         keys = key.split('.')
         if not keys:
             return
-        node = self._data
-        parent_nodes = []
-        for k in keys[:-1]:
-            parent_nodes.append((node, k))
-            node = getattr(node, k, None)
-            if node is None:
+
+        # 使用一个栈来追踪访问路径，(字典, 键)
+        path_stack = []
+        current_dict = self._data.data
+
+        # 导航到目标位置
+        for i, k in enumerate(keys[:-1]):
+            if isinstance(current_dict, dict) and k in current_dict:
+                path_stack.append((current_dict, k))
+                current_dict = current_dict[k]
+            else:
+                # 路径不存在，无需删除
                 return
+
+        # 删除最后一个键
         final_key = keys[-1]
-        if final_key in node.data:
-            del node.data[final_key]
-            while parent_nodes:
-                parent, key_in_parent = parent_nodes.pop()
-                if not parent[key_in_parent].data:
-                    del parent[key_in_parent]
+        if isinstance(current_dict, dict) and final_key in current_dict:
+            del current_dict[final_key]
+
+            # 回溯并清理空的父字典
+            while path_stack:
+                parent_dict, parent_key = path_stack.pop()
+                child_dict = parent_dict[parent_key]
+                if isinstance(child_dict, dict) and not child_dict:
+                    del parent_dict[parent_key]
                 else:
+                    # 如果子节点非空，则停止回溯
                     break
-            if self.auto_save:
-                self.save()
+
+        if self.auto_save:
+            self.save()
+
 
     def _load(self):
         """从文件加载配置。"""
         with self._lock:
             try:
-                # 统一用二进制模式读取
+                # 统一用二进制模式预读，以判断是否加密
                 with open(self._file, 'rb') as f:
                     raw_data = f.read()
-                    # 判断加密头
-                    if raw_data.startswith(ENCRYPT_HEADER):
-                        if not self._key:
-                            raise ValueError("此文件为加密文件，请提供密码")
-                        try:
-                            raw_data = self._decrypt_data(raw_data)
-                        except Exception as e:
-                            # 文件已关闭，可以安全备份
-                            if os.path.exists(self._file):
-                                try:
-                                    old_path = self._file + ".old"
-                                    os.rename(self._file, old_path)
-                                    print(f"原配置已备份为 {old_path}")
-                                except Exception as e2:
-                                    print(f"备份原配置失败：{e2}")
-                            # 重新抛出异常，外层会捕获并打印
-                            raise
-                    else:
-                        # 明文时再用文本模式重新读取
-                        with open(self._file, 'r', encoding='utf-8') as f2:
-                            raw_data = self._handler.load(f2)
-                    self._data = ConfigNode(raw_data, manager=self)
-            except FileNotFoundError as e:
-                print(f"配置文件 {self._file} 未找到：{e}")
-            except Exception as e:
-                print(f"加载配置文件 {self._file} 失败：{e}")
+
+                # 如果文件为空，则初始化为空配置
+                if not raw_data:
+                    self._data = ConfigNode({}, manager=self)
+                    return
+
+                # 判断加密头
+                if raw_data.startswith(ENCRYPT_HEADER):
+                    if not self._key:
+                        raise ValueError("此文件为加密文件，请提供密码")
+                    # _decrypt_data 会在失败时抛出异常
+                    decrypted_data = self._decrypt_data(raw_data)
+                    self._data = ConfigNode(decrypted_data, manager=self)
+                else:
+                    # 对于明文文件，根据 handler 的模式选择正确的读写方式
+                    read_mode = 'r' + self._handler.mode
+                    encoding = 'utf-8' if 'b' not in read_mode else None
+                    with open(self._file, read_mode, encoding=encoding) as f2:
+                        loaded_data = self._handler.load(f2)
+                    self._data = ConfigNode(loaded_data, manager=self)
+
+            except FileNotFoundError:
+                # 文件不存在是正常情况，将在首次保存时创建。
+                # 初始化为空数据，以避免后续操作出错。
+                self._data = ConfigNode({}, manager=self)
+            # 其他所有异常（如解密失败、解析错误）都将正常抛出，不再被静默处理。
 
     def reload(self):
         """
@@ -391,7 +405,8 @@ class Config:
         """
         target_file = self.ensure_extension(file) if file else self._file
         target_way = self.validate_format(way) if way else self._way
-        self._write_to_file(target_file, target_way)
+        with self._lock:
+            self._write_to_file(target_file, target_way)
         print(f"配置已成功另存到 {target_file}")
 
     def _write_to_file(self, target_file, target_way):
@@ -403,22 +418,21 @@ class Config:
         target_handler = ConfigHandlerFactory.get_handler(target_way)
         self._ensure_file_exists(file_path=target_file)
 
-        with self._lock:
-            try:
-                config_data = self._data.to_dict()
+        try:
+            config_data = self._data.to_dict()
 
-                if self._key:
-                    encrypted_data = self._encrypt_data(config_data)
-                    with open(target_file, 'wb') as f:
-                        f.write(encrypted_data)
-                else:
-                    mode = 'w' + target_handler.mode
-                    encoding = 'utf-8' if 'b' not in mode else None
-                    with open(target_file, mode, encoding=encoding) as f:
-                        target_handler.save(config_data, f)
-            except Exception as e:
-                # 重新抛出异常，让调用方处理
-                raise IOError(f"写入文件 {target_file} 失败: {e}") from e
+            if self._key:
+                encrypted_data = self._encrypt_data(config_data)
+                with open(target_file, 'wb') as f:
+                    f.write(encrypted_data)
+            else:
+                mode = 'w' + target_handler.mode
+                encoding = 'utf-8' if 'b' not in mode else None
+                with open(target_file, mode, encoding=encoding) as f:
+                    target_handler.save(config_data, f)
+        except Exception as e:
+            # 重新抛出异常，让调用方处理
+            raise IOError(f"写入文件 {target_file} 失败: {e}") from e
 
     def _ensure_file_exists(self, file_path=None):
         """确保配置文件存在。"""
@@ -499,7 +513,14 @@ class Config:
         return repr(self.dict)
 
     def __getattr__(self, item):
-        """属性访问代理到配置数据。"""
+        """属性访问代理到配置数据，优先访问配置键。"""
+        # 优先在配置字典中查找 `item`，以解决配置键与内部属性（如 'data'）的命名冲突。
+        # 直接访问 ._data 字典，避免触发 ConfigNode 的 __getattr__。
+        if item in self._data._data:
+            # 使用 __getitem__ 来获取值，它能正确处理嵌套并返回节点或值。
+            return self._data[item]
+        
+        # 如果不是配置键，则假定它是 ConfigNode 上的一个方法或属性。
         return getattr(self._data, item)
 
     def __getitem__(self, item):
@@ -542,16 +563,17 @@ class Config:
             setattr(self._data, key, value)
 
     def __delattr__(self, key):
-        """属性删除代理到配置数据。"""
+        """属性删除代理到配置数据，使其行为与 del_key 一致。"""
         if key.startswith('_'):
             super().__delattr__(key)
         else:
-            if hasattr(self._data, key):
-                delattr(self._data, key)
-                self.mark_dirty()
-                if self.auto_save:
-                    self.save()
-            else:
+            # 使用 read 来检查key是否存在，以避免触发__getattr__的自动创建
+            try:
+                self.read(key)
+                # key 存在，可以删除
+                self.del_key(key)
+            except (KeyError, AttributeError):
+                # read 失败会抛出 KeyError, 如果路径无效则可能 AttributeError
                 raise AttributeError(f"'Config' object has no attribute '{key}'")
 
     def __setitem__(self, key, value):
