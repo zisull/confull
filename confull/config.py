@@ -54,18 +54,22 @@ class Config:
 
     def _generate_key(self, password):
         """
-        从密码生成加密密钥。
+        从密码生成加密密钥，使用盐值增强安全性。
         :param password: 密码字符串
         :return: 加密密钥
         """
         if not password:
             return None
-        # 使用SHA256生成固定长度的密钥
-        return hashlib.sha256(password.encode()).digest()
+        
+        # 生成8字节的随机盐值
+        self._salt = os.urandom(8)
+        
+        # 使用密码和盐值生成密钥
+        return hashlib.sha256(password.encode() + self._salt).digest()
 
     def _encrypt_data(self, data):
         """
-        简单异或加密数据。
+        简单加密数据，使用盐值增强安全性。
         :param data: 要加密的数据
         :return: 加密后的数据
         """
@@ -74,14 +78,16 @@ class Config:
         
         # 将数据转换为JSON字符串
         json_data = orjson.dumps(data)
-        data_bytes = json_data
         
         # 简单异或加密
         encrypted = bytearray()
-        for i, byte in enumerate(data_bytes):
+        for i, byte in enumerate(json_data):
             encrypted.append(byte ^ self._key[i % len(self._key)])
         
-        return base64.b64encode(bytes(encrypted))
+        # 盐值(8字节) + 加密数据
+        result = self._salt + bytes(encrypted)
+        
+        return base64.b64encode(result)
 
     def _decrypt_data(self, encrypted_data):
         """
@@ -94,9 +100,16 @@ class Config:
         
         try:
             # 解码base64
-            encrypted_bytes = base64.b64decode(encrypted_data)
+            data = base64.b64decode(encrypted_data)
             
-            # 异或解密
+            # 提取盐值
+            self._salt = data[:8]
+            encrypted_bytes = data[8:]
+            
+            # 重新生成密钥
+            self._key = hashlib.sha256(self._pwd.encode() + self._salt).digest()
+            
+            # 解密数据
             decrypted = bytearray()
             for i, byte in enumerate(encrypted_bytes):
                 decrypted.append(byte ^ self._key[i % len(self._key)])
