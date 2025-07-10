@@ -7,6 +7,8 @@ import os
 import xml.etree.ElementTree as ElementTree
 from collections.abc import MutableMapping
 from threading import Lock
+import hashlib
+import base64
 
 import orjson
 import toml
@@ -16,10 +18,11 @@ import yaml
 class Config:
     """
     多格式配置管理器，支持 dict <=> [ini, xml, json, toml, yaml] 的读写与自动保存。
+    支持密码加密保护。
     """
 
     def __init__(self, data=None, file="config", way="toml", replace=False,
-                 auto_save=True):
+                 auto_save=True, pwd=None):
         """
         初始化配置管理器。
         :param data: 初始配置数据（dict）
@@ -27,11 +30,14 @@ class Config:
         :param way: 配置文件格式（json/toml/yaml/ini/xml）
         :param replace: 是否覆盖已有配置文件
         :param auto_save: 是否自动保存
+        :param pwd: 密码字符串，用于加密配置文件
         """
         self._file = file
         self._way = self.validate_format(way)
         self._file = self.ensure_extension(file)  # # 调用 ensure_extension 来创建目录和添加扩展名
         self._auto_save = auto_save
+        self._pwd = pwd
+        self._key = self._generate_key(pwd) if pwd else None
         self._data = ConfigNode(data if data is not None else {}, manager=self)
         self._dirty = False if data is not None else True
         self._lock = Lock()
@@ -45,6 +51,60 @@ class Config:
                 self._data = ConfigNode(data, manager=self)
                 self._dirty = True  # 强制标记需要保存
             self.save()  # 确保立即保存初始数据
+
+    def _generate_key(self, password):
+        """
+        从密码生成加密密钥。
+        :param password: 密码字符串
+        :return: 加密密钥
+        """
+        if not password:
+            return None
+        # 使用SHA256生成固定长度的密钥
+        return hashlib.sha256(password.encode()).digest()
+
+    def _encrypt_data(self, data):
+        """
+        简单异或加密数据。
+        :param data: 要加密的数据
+        :return: 加密后的数据
+        """
+        if not self._key:
+            return data
+        
+        # 将数据转换为JSON字符串
+        json_data = orjson.dumps(data)
+        data_bytes = json_data
+        
+        # 简单异或加密
+        encrypted = bytearray()
+        for i, byte in enumerate(data_bytes):
+            encrypted.append(byte ^ self._key[i % len(self._key)])
+        
+        return base64.b64encode(bytes(encrypted))
+
+    def _decrypt_data(self, encrypted_data):
+        """
+        解密数据。
+        :param encrypted_data: 加密的数据
+        :return: 解密后的数据
+        """
+        if not self._key:
+            return encrypted_data
+        
+        try:
+            # 解码base64
+            encrypted_bytes = base64.b64decode(encrypted_data)
+            
+            # 异或解密
+            decrypted = bytearray()
+            for i, byte in enumerate(encrypted_bytes):
+                decrypted.append(byte ^ self._key[i % len(self._key)])
+            
+            return orjson.loads(bytes(decrypted))
+        except Exception as e:
+            print(f"解密数据失败：{e}")
+            return {}
 
     @property
     def json(self):
@@ -211,7 +271,16 @@ class Config:
             try:
                 with open(self._file, 'rb' if self._way == "json" else 'r',
                           encoding=None if self._way == "json" else 'utf-8') as f:
-                    raw_data = self._handler.load(f)
+                    raw_data = f.read()
+                    
+                    # 如果设置了密码，先解密
+                    if self._key:
+                        raw_data = self._decrypt_data(raw_data)
+                    else:
+                        # 没有密码时，使用原来的方式加载
+                        f.seek(0)  # 重置文件指针
+                        raw_data = self._handler.load(f)
+                    
                     self._data = ConfigNode(raw_data, manager=self)
             except FileNotFoundError as e:
                 print(f"配置文件 {self._file} 未找到：{e}")
@@ -241,10 +310,21 @@ class Config:
                 return
             try:
                 self._ensure_file_exists()
-                # 修复：为 XML 格式添加二进制写入模式
-                with open(self._file, 'wb' if self._way in ["json", "xml"] else 'w',
-                          encoding=None if self._way in ["json", "xml"] else 'utf-8') as f:
-                    self._handler.save(self._data.to_dict(), f)
+                
+                # 获取配置数据
+                config_data = self._data.to_dict()
+                
+                # 如果设置了密码，先加密
+                if self._key:
+                    encrypted_data = self._encrypt_data(config_data)
+                    with open(self._file, 'wb') as f:
+                        f.write(encrypted_data)
+                else:
+                    # 没有密码时，使用原来的方式保存
+                    with open(self._file, 'wb' if self._way in ["json", "xml"] else 'w',
+                              encoding=None if self._way in ["json", "xml"] else 'utf-8') as f:
+                        self._handler.save(config_data, f)
+                
                 self._dirty = False
             except Exception as e:
                 print(f"保存配置文件失败 {self._file}: {e}")
@@ -265,10 +345,19 @@ class Config:
 
         with self._lock:
             try:
-                # 打开文件并保存数据
-                with open(target_file, 'wb' if target_way == "json" else 'w',
-                          encoding=None if target_way == "json" else 'utf-8') as f:
-                    target_handler.save(self._data.to_dict(), f)
+                # 获取配置数据
+                config_data = self._data.to_dict()
+                
+                # 如果设置了密码，先加密
+                if self._key:
+                    encrypted_data = self._encrypt_data(config_data)
+                    with open(target_file, 'wb') as f:
+                        f.write(encrypted_data)
+                else:
+                    # 没有密码时，使用原来的方式保存
+                    with open(target_file, 'wb' if target_way == "json" else 'w',
+                              encoding=None if target_way == "json" else 'utf-8') as f:
+                        target_handler.save(config_data, f)
 
                 print(f"配置已成功另存到 {target_file}")
             except Exception as e:

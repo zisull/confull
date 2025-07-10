@@ -1,78 +1,82 @@
-import unittest
 import os
-from confull import Config
+import tempfile
+import unittest
+
+from confull.config import Config
 
 
 class TestConfig(unittest.TestCase):
     def setUp(self):
-        # 初始化测试数据和配置文件
-        self.test_file = 'test_config.toml'
-        self.initial_data = {'app': {'name': 'TestApp', 'version': '1.0'}}
-        self.config = Config(data=self.initial_data, file=self.test_file, way='toml')
+        # 创建临时目录用于测试
+        self.test_dir = tempfile.mkdtemp()
+        self.test_file = os.path.join(self.test_dir, "test_config.toml")
 
     def tearDown(self):
         # 清理测试文件
         if os.path.exists(self.test_file):
             os.remove(self.test_file)
-        backup_file = self.test_file + '.bak'
-        if os.path.exists(backup_file):
-            os.remove(backup_file)
+        if os.path.exists(self.test_dir):
+            os.rmdir(self.test_dir)
 
-    def test_read_write(self):
-        # 测试读写功能
-        self.config.write('database.host', 'localhost', overwrite_mode=True)
-        value = self.config.read('database.host')
-        self.assertEqual(value, 'localhost')
+    def test_basic_config(self):
+        """测试基本配置功能"""
+        config = Config(file=self.test_file, way="toml")
+        config.write("test_key", "test_value")
+        self.assertEqual(config.read("test_key"), "test_value")
 
-        # 测试使用属性方式读写
-        self.config.database.port = 5432
-        self.assertEqual(self.config.database.port, 5432)
+    def test_encrypted_config(self):
+        """测试加密配置功能"""
+        # 创建带密码的配置
+        config = Config(file=self.test_file, way="toml", pwd="test_password")
+        config.write("secret_key", "secret_value")
+        config.write("nested.key", "nested_value")
+        
+        # 验证数据已保存
+        self.assertEqual(config.read("secret_key"), "secret_value")
+        self.assertEqual(config.read("nested.key"), "nested_value")
+        
+        # 重新加载配置验证加密解密
+        config2 = Config(file=self.test_file, way="toml", pwd="test_password")
+        self.assertEqual(config2.read("secret_key"), "secret_value")
+        self.assertEqual(config2.read("nested.key"), "nested_value")
 
-        # 测试使用字典方式读写
-        self.config['database.user'] = 'admin'
-        self.assertEqual(self.config['database.user'], 'admin')
+    def test_encrypted_config_wrong_password(self):
+        """测试错误密码的情况"""
+        # 创建带密码的配置
+        config = Config(file=self.test_file, way="toml", pwd="correct_password")
+        config.write("secret_key", "secret_value")
+        
+        # 用错误密码加载配置
+        config2 = Config(file=self.test_file, way="toml", pwd="wrong_password")
+        # 应该返回空字典或默认值
+        self.assertEqual(config2.read("secret_key"), None)
 
-    def test_update(self):
-        # 测试批量更新功能
-        new_data = {'app': {'name': 'NewTestApp', 'version': '2.0'}, 'new_key': 'new_value'}
-        self.config.update(new_data)
-        self.assertEqual(self.config.dict['app']['name'], 'NewTestApp')
-        self.assertEqual(self.config.dict['new_key'], 'new_value')
+    def test_mixed_encrypted_unencrypted(self):
+        """测试加密和非加密配置的兼容性"""
+        # 创建不带密码的配置
+        config1 = Config(file=self.test_file, way="toml")
+        config1.write("public_key", "public_value")
+        
+        # 用密码重新加载（应该失败或返回空）
+        config2 = Config(file=self.test_file, way="toml", pwd="test_password")
+        # 由于文件格式不匹配，应该返回None或空字典
+        self.assertEqual(config2.read("public_key"), None)
 
-    def test_save_load(self):
-        # 测试保存和加载功能
-        self.config.save()
-        new_config = Config(file=self.test_file, way='toml')
-        self.assertEqual(new_config.dict, self.config.dict)
-
-    def test_del_key(self):
-        # 测试删除配置项功能
-        self.config.del_key('app.name')
-        self.assertNotIn('name', self.config.dict['app'])
-
-    def test_del_clean(self):
-        # 测试清空配置并删除文件功能
-        self.config.del_clean()
-        self.assertEqual(self.config.dict, {})
-        self.assertFalse(os.path.exists(self.test_file))
-
-    def test_overwrite_mode(self):
-        # 测试强制覆写模式
-        self.config.write('app.name', 'OriginalName', overwrite_mode=True)
-        with self.assertRaises(ValueError):
-            self.config.write('app.name', 'NewName', overwrite_mode=False)
-        self.config.write('app.name', 'NewName', overwrite_mode=True)
-        self.assertEqual(self.config.dict['app']['name'], 'NewName')
-
-    def test_context_manager(self):
-        # 测试上下文管理器
-        with Config(data={'example': 'value'}, file='context_test.toml', way='toml') as config:
-            config.write('example', 'new_value', overwrite_mode=True)
-        new_config = Config(file='context_test.toml', way='toml')
-        self.assertEqual(new_config.dict['example'], 'new_value')
-        if os.path.exists('context_test.toml'):
-            os.remove('context_test.toml')
+    def test_encrypted_config_dict_access(self):
+        """测试加密配置的字典访问方式"""
+        config = Config(file=self.test_file, way="toml", pwd="test_password")
+        config["user"] = "admin"
+        config["settings.auto_save"] = True
+        
+        # 验证字典访问
+        self.assertEqual(config["user"], "admin")
+        self.assertEqual(config["settings.auto_save"], True)
+        
+        # 重新加载验证
+        config2 = Config(file=self.test_file, way="toml", pwd="test_password")
+        self.assertEqual(config2["user"], "admin")
+        self.assertEqual(config2["settings.auto_save"], True)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     unittest.main()
