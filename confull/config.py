@@ -333,6 +333,15 @@ class Config:
             except Exception as e:
                 print(f"加载配置文件 {self._file} 失败：{e}")
 
+    def reload(self):
+        """
+        从磁盘重新加载配置文件。
+        注意：这将丢弃所有未保存的更改。
+        """
+        self._load()
+        self._dirty = False
+        print(f"配置已从 {self._file} 重新加载。")
+
     def load(self, file=None, way=None):
         """
         切换配置文件或格式（不自动加载内容）。
@@ -775,14 +784,7 @@ class ConfigNode(MutableMapping):
             super().__setattr__(key, value)
         else:
             self._data[key] = value
-            # 递归找到最顶层的 manager 并触发保存
-            node = self
-            while hasattr(node, '_parent') and node._parent is not None:
-                node = node._parent
-            if hasattr(node, '_manager') and node._manager is not None:
-                node._manager.mark_dirty()
-                if node._manager.auto_save:
-                    node._manager.save()
+            self._trigger_save()
 
     def to_dict(self):
         """递归转为 dict。"""
