@@ -6,12 +6,25 @@
 
 `confull` is a multi-format configuration management tool that supports read and write operations between `dict` and formats such as `ini`, `xml`, `json`, `toml`, and `yaml`, and can automatically save configurations. It provides a convenient interface to manage configuration data and allows you to switch configuration files and formats as needed.
 
+### Features
+- Multi-format support: json, toml, yaml, ini, xml
+- Dict <=> config file conversion
+- Dot-path access and write (e.g. a.b.c)
+- Auto-save
+- Optional encryption (new, set `pwd` for secure storage)
+- Thread-safe
+- Simple, easy to integrate
+
+### Change Log
+- **Backup feature removed** for simplicity.
+- **Encryption feature added**: just set `pwd` to enable auto encryption/decryption.
+
 ### Installation
 
 Run the following command in the command line to install `confull`:
 
-```cmd
-pip install confull
+```bash
+pip install orjson toml pyyaml
 ```
 
 ## II. Class and Method Descriptions
@@ -24,16 +37,10 @@ This class is the core of the configuration manager, responsible for reading, wr
 
 ```python
 def __init__(self, data: dict = None, file: str = "config", way: str = "toml", replace: bool = False,
-             auto_save: bool = True, backup: bool = False):
+             auto_save: bool = True, pwd: str = None):
 ```
-
-- Parameter Explanation:
-  - `data`: Initial configuration data, of type `dict`, default is `None`.
-  - `file`: Configuration file name (extension can be omitted), default is `"config"`. If the specified directory does not exist, it will be automatically created.
-  - `way`: Configuration file format, supports `json`, `toml`, `yaml`, `ini`, `xml`, default is `"toml"`.
-  - `replace`: Whether to overwrite the existing configuration file, boolean, default is `False`.
-  - `auto_save`: Whether to save automatically, boolean, default is `True`.
-  - `backup`: Whether to back up the original configuration file, boolean, default is `False`.
+- New param `pwd` for encryption.
+- Param `backup` removed.
 
 #### Attributes
 
@@ -85,12 +92,26 @@ def __init__(self, data: dict = None, file: str = "config", way: str = "toml", r
 | `__setattr__(self, key, value)`             | Attribute assignment is proxied to the configuration data, internal attributes use the `_` prefix. |
 | `__delattr__(self, key)`                    | Attribute deletion is proxied to the configuration data.     |
 
-III. Usage Examples
+## III. Usage Examples
 
 ```python
 from confull import Config
 
-# 1. Initialize the configuration manager
+# 1. Basic usage
+cc = Config()
+cc.write('database.host', 'localhost')
+print(cc.read('database.host'))
+
+# 2. Encrypted usage (new)
+cc_enc = Config(file='secure.toml', way='toml', pwd='your_password')
+cc_enc.write('secret', 'abc')
+print(cc_enc.read('secret'))  # auto decrypt
+
+# 3. Dot-path support
+cc.write('db.host', 'localhost', overwrite_mode=True)
+print(cc.read('db.host'))
+
+# 4. Initialize the configuration manager
 # Initialize with default parameters
 cc = Config()
 
@@ -98,7 +119,7 @@ cc = Config()
 initial_data = {'app': {'name': 'MyApp', 'version': '1.0'}}
 cc = Config(data=initial_data, file='custom_config', way='json', replace=False, auto_save=True, backup=True)
 
-# 2. Basic read and write operations
+# 5. Basic read and write operations
 # Write a configuration item using dot notation path
 cc.write('database.host', 'localhost')
 
@@ -118,19 +139,19 @@ cc['database.user'] = 'admin'
 user = cc['database.user']
 print(f"Database user (using dict access): {user}")
 
-# 3. Batch update configuration items
+# 6. Batch update configuration items
 new_data = {'app': {'name': 'NewApp', 'version': '2.0'}, 'new_key': 'new_value'}
 cc.update(new_data)
 print("Updated config:", cc.dict)
 
-# 4. Save and save as a different file
+# 7. Save and save as a different file
 # Save the configuration file
 cc.save()
 
 # Save as a specified file and format
 cc.save_to_file(file='backup_config', way='yaml')
 
-# 5. Delete configuration items and clear the configuration
+# 8. Delete configuration items and clear the configuration
 # Delete a configuration item
 cc.del_key('database.host')
 del cc.database.port
@@ -139,61 +160,61 @@ del cc['database.user']
 # Clear the configuration and delete the file
 cc.del_clean()
 
-# 6. Switch configuration file or format
+# 9. Switch configuration file or format
 cc.load(file='new_config', way='toml')
 
-# 7. Mark the configuration as changed and save manually
+# 10. Mark the configuration as changed and save manually
 cc.mark_dirty()
 cc.save()
 
-# 8. Use the context manager
+# 11. Use the context manager
 with Config(data={'example': 'value'}, file='context_config', way='toml') as config:
     config.write('example', 'new_value')
     # Automatically save when leaving the context
 
-# 9. Use the __del__ magic function
+# 12. Use the __del__ magic function
 temp_config = Config(data={'test': 'data'}, file='del_test', way='json')
 # When the temp_config object is destroyed, if auto_save is True, it will automatically save the configuration
 del temp_config
 
-# 10. Use the dict attribute to set and get configuration data in batches
+# 13. Use the dict attribute to set and get configuration data in batches
 cc = Config()
 cc.dict = {'location': 'Beijing', 'books': {'quantity': 100, 'price': 10.5}, 'students': {'quantity': 1000, 'age': 20}}
 print("Config data using dict property:", cc.dict)
 
-# 11. Use the forced overwrite mode
+# 14. Use the forced overwrite mode
 dic_ = {'school': 'pass'}
 cc = Config(data=dic_)
 cc.write('school.university', 'University', overwrite_mode=True)  # overwrite_mode=True forces overwrite, but the original path will be deleted
 print("Config after forced overwrite:", cc.dict)
 
-# 12. Check if a configuration item exists
+# 15. Check if a configuration item exists
 print("Does 'school' exist in cc?", 'school' in cc)
 
-# 13. Iterate over configuration items
+# 16. Iterate over configuration items
 for key in cc:
     print(f"Key: {key}, Value: {cc[key]}")
 
-# 14. Get the number of configuration items
+# 17. Get the number of configuration items
 print("Number of configuration items:", len(cc))
 
-# 15. Use the __call__ method
+# 18. Use the __call__ method
 value = cc('school.university')
 print(f"Value of 'school.university' using __call__: {value}")
 
-# 16. Check if the configuration is non-empty
+# 19. Check if the configuration is non-empty
 print("Is cc non-empty?", bool(cc))
 
-# 17. Use the pop method to delete and return the value of the specified key
+# 20. Use the pop method to delete and return the value of the specified key
 cc = Config(data={'a': 1, 'b': 2})
 popped_value = cc.pop('a')
 print(f"Popped value: {popped_value}, Remaining config: {cc.dict}")
 
-# 18. Use the clear method to clear the configuration data
+# 21. Use the clear method to clear the configuration data
 cc.clear()
 print("Config after clear:", cc.dict)
 
-# 19. Use the get method to safely get a configuration item
+# 22. Use the get method to safely get a configuration item
 default_value = cc.get('non_existent_key', 'default')
 print(f"Value of non-existent key using get: {default_value}")
 ```
@@ -203,6 +224,7 @@ print(f"Value of non-existent key using get: {default_value}")
 - When using methods such as `write`, `update`, `set_data`, `del_key` to modify configuration data, if `auto_save` is `True`, the configuration file will be saved automatically.
 - If the configuration file format is not supported, a `ValueError` exception will be thrown.
 - When using the `INIConfigHandler` to save the configuration, if the data is not a nested dictionary, it will be wrapped in a default `'Default'` section.
+- **Encryption**: Just set `pwd` to enable encryption. File is encrypted on save, auto-decrypted on load. Fast XOR+SHA256 encryption, minimal dependencies, high performance. No password: behaves as normal config.
 
 ## Conclusion
 
