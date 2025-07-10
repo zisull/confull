@@ -4,7 +4,6 @@
 
 import configparser
 import os
-import shutil
 import xml.etree.ElementTree as ElementTree
 from collections.abc import MutableMapping
 from threading import Lock
@@ -20,7 +19,7 @@ class Config:
     """
 
     def __init__(self, data=None, file="config", way="toml", replace=False,
-                 auto_save=True, backup=False):
+                 auto_save=True):
         """
         初始化配置管理器。
         :param data: 初始配置数据（dict）
@@ -28,7 +27,6 @@ class Config:
         :param way: 配置文件格式（json/toml/yaml/ini/xml）
         :param replace: 是否覆盖已有配置文件
         :param auto_save: 是否自动保存
-        :param backup: 是否备份原配置文件
         """
         self._file = file
         self._way = self.validate_format(way)
@@ -36,7 +34,6 @@ class Config:
         self._auto_save = auto_save
         self._data = ConfigNode(data if data is not None else {}, manager=self)
         self._dirty = False if data is not None else True
-        self._backup = backup
         self._lock = Lock()
         self._handler = ConfigHandlerFactory.get_handler(self._way)
 
@@ -74,15 +71,7 @@ class Config:
         """设置自动保存。"""
         self._auto_save = value
 
-    @property
-    def backup(self):
-        """是否备份原配置文件。"""
-        return self._backup
 
-    @backup.setter
-    def backup(self, value):
-        """设置是否备份原配置文件。"""
-        self._backup = value
 
     @property
     def str(self):
@@ -251,7 +240,6 @@ class Config:
             if not self._dirty:
                 return
             try:
-                self._backup_file()
                 self._ensure_file_exists()
                 # 修复：为 XML 格式添加二进制写入模式
                 with open(self._file, 'wb' if self._way in ["json", "xml"] else 'w',
@@ -292,14 +280,7 @@ class Config:
             with open(self._file, 'w'):
                 pass  # 创建一个空文件
 
-    def _backup_file(self):
-        """备份原配置文件（如果存在且 backup 选项为 True）。"""
-        if self.backup and os.path.exists(self._file):
-            backup_file = self._file + '.bak'
-            try:
-                shutil.copy2(self._file, backup_file)  # 复制文件，保留元数据
-            except Exception as e:
-                print(f"备份文件失败: {e}")
+
 
     def _recursive_update(self, original, new_data):
         """
