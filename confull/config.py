@@ -14,6 +14,8 @@ import orjson
 import toml
 import yaml
 
+ENCRYPT_HEADER = b'CONFULLENC:'
+MD5_SIZE = 32  # 32字节的十六进制MD5字符串
 
 class Config:
     """
@@ -69,54 +71,64 @@ class Config:
 
     def _encrypt_data(self, data):
         """
-        简单加密数据，使用盐值增强安全性。
+        简单加密数据，使用盐值增强安全性，并加上MD5摘要。
         :param data: 要加密的数据
         :return: 加密后的数据
         """
         if not self._key:
             return data
-        
         # 将数据转换为JSON字符串
         json_data = orjson.dumps(data)
-        
+        # 计算MD5摘要（十六进制字符串，32字节）
+        md5_digest = hashlib.md5(json_data).hexdigest().encode()
         # 简单异或加密
         encrypted = bytearray()
         for i, byte in enumerate(json_data):
             encrypted.append(byte ^ self._key[i % len(self._key)])
-        
         # 盐值(8字节) + 加密数据
         result = self._salt + bytes(encrypted)
-        
-        return base64.b64encode(result)
+        # 返回带标记和MD5的加密数据
+        return ENCRYPT_HEADER + md5_digest + base64.b64encode(result)
 
     def _decrypt_data(self, encrypted_data):
         """
-        解密数据。
+        解密数据，校验MD5摘要。
         :param encrypted_data: 加密的数据
         :return: 解密后的数据
         """
         if not self._key:
             return encrypted_data
-        
+        if not self._pwd:
+            print("解密时密码不能为空")
+            return {}
+        # 判断是否有加密头
+        if not encrypted_data.startswith(ENCRYPT_HEADER):
+            # 不是加密内容，直接返回原数据
+            return encrypted_data
         try:
+            # 去除加密头
+            encrypted_data = encrypted_data[len(ENCRYPT_HEADER):]
+            # 取出MD5摘要
+            md5_digest = encrypted_data[:MD5_SIZE]
+            encrypted_data = encrypted_data[MD5_SIZE:]
             # 解码base64
             data = base64.b64decode(encrypted_data)
-            
             # 提取盐值
             self._salt = data[:8]
             encrypted_bytes = data[8:]
-            
             # 重新生成密钥
             self._key = hashlib.sha256(self._pwd.encode() + self._salt).digest()
-            
             # 解密数据
             decrypted = bytearray()
             for i, byte in enumerate(encrypted_bytes):
                 decrypted.append(byte ^ self._key[i % len(self._key)])
-            
+            # 校验MD5
+            calc_md5 = hashlib.md5(bytes(decrypted)).hexdigest().encode()
+            if calc_md5 != md5_digest:
+                raise ValueError("解密后MD5校验失败，可能是密码错误或数据损坏。")
             return orjson.loads(bytes(decrypted))
         except Exception as e:
-            print(f"解密数据失败：{e}")
+            print(f"解密数据失败（可能是密码错误或数据损坏）：{e}")
             return {}
 
     @property
@@ -282,18 +294,30 @@ class Config:
         """从文件加载配置。"""
         with self._lock:
             try:
-                with open(self._file, 'rb' if self._way == "json" else 'r',
-                          encoding=None if self._way == "json" else 'utf-8') as f:
+                # 统一用二进制模式读取
+                with open(self._file, 'rb') as f:
                     raw_data = f.read()
-                    
-                    # 如果设置了密码，先解密
-                    if self._key:
-                        raw_data = self._decrypt_data(raw_data)
+                    # 判断加密头
+                    if raw_data.startswith(ENCRYPT_HEADER):
+                        if not self._key:
+                            raise ValueError("此文件为加密文件，请提供密码")
+                        try:
+                            raw_data = self._decrypt_data(raw_data)
+                        except Exception as e:
+                            # 文件已关闭，可以安全备份
+                            if os.path.exists(self._file):
+                                try:
+                                    old_path = self._file + ".old"
+                                    os.rename(self._file, old_path)
+                                    print(f"原配置已备份为 {old_path}")
+                                except Exception as e2:
+                                    print(f"备份原配置失败：{e2}")
+                            # 重新抛出异常，外层会捕获并打印
+                            raise
                     else:
-                        # 没有密码时，使用原来的方式加载
-                        f.seek(0)  # 重置文件指针
-                        raw_data = self._handler.load(f)
-                    
+                        # 明文时再用文本模式重新读取
+                        with open(self._file, 'r', encoding='utf-8') as f2:
+                            raw_data = self._handler.load(f2)
                     self._data = ConfigNode(raw_data, manager=self)
             except FileNotFoundError as e:
                 print(f"配置文件 {self._file} 未找到：{e}")
@@ -322,11 +346,36 @@ class Config:
             if not self._dirty:
                 return
             try:
+                # 写入前校验：如果文件存在且为加密文件，校验头和MD5
+                if os.path.exists(self._file):
+                    with open(self._file, 'rb') as f:
+                        raw = f.read()
+                        if raw.startswith(ENCRYPT_HEADER):
+                            # 取出MD5摘要
+                            md5_digest = raw[len(ENCRYPT_HEADER):len(ENCRYPT_HEADER)+MD5_SIZE]
+                            encrypted_data = raw[len(ENCRYPT_HEADER)+MD5_SIZE:]
+                            try:
+                                data = base64.b64decode(encrypted_data)
+                                salt = data[:8]
+                                encrypted_bytes = data[8:]
+                                if not self._key:
+                                    raise ValueError('加密文件校验失败：未提供密码，拒绝写入！')
+                                key = hashlib.sha256(self._pwd.encode() + salt).digest()
+                                decrypted = bytearray()
+                                for i, byte in enumerate(encrypted_bytes):
+                                    decrypted.append(byte ^ key[i % len(key)])
+                                calc_md5 = hashlib.md5(bytes(decrypted)).hexdigest().encode()
+                                if md5_digest is None:
+                                    raise ValueError('加密文件校验失败（摘要缺失），拒绝写入！')
+                                if not isinstance(md5_digest, bytes):
+                                    raise ValueError('加密文件校验失败（摘要类型错误），拒绝写入！')
+                                if calc_md5 != md5_digest:
+                                    raise ValueError('加密文件校验失败（密码错误或数据损坏），拒绝写入！')
+                            except Exception as e:
+                                raise ValueError(f'加密文件校验失败，拒绝写入！原因：{e}')
                 self._ensure_file_exists()
-                
                 # 获取配置数据
                 config_data = self._data.to_dict()
-                
                 # 如果设置了密码，先加密
                 if self._key:
                     encrypted_data = self._encrypt_data(config_data)
@@ -337,7 +386,6 @@ class Config:
                     with open(self._file, 'wb' if self._way in ["json", "xml"] else 'w',
                               encoding=None if self._way in ["json", "xml"] else 'utf-8') as f:
                         self._handler.save(config_data, f)
-                
                 self._dirty = False
             except Exception as e:
                 print(f"保存配置文件失败 {self._file}: {e}")
