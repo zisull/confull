@@ -271,7 +271,7 @@ class Config:
         if self.auto_save:
             self.save()
 
-    def del_key(self, key: str):
+    def del_key(self, key):
         """
         删除指定配置项，支持点号路径，并会自动清理空的父节点。
         :param key: 配置项路径
@@ -515,8 +515,8 @@ class Config:
     def __getattr__(self, item):
         """属性访问代理到配置数据，优先访问配置键。"""
         # 优先在配置字典中查找 `item`，以解决配置键与内部属性（如 'data'）的命名冲突。
-        # 直接访问 ._data 字典，避免触发 ConfigNode 的 __getattr__。
-        if item in self._data._data:
+        # 使用 has_top_level_key 方法安全地检查键是否存在，避免直接访问受保护成员。
+        if self._data.has_top_level_key(item):
             # 使用 __getitem__ 来获取值，它能正确处理嵌套并返回节点或值。
             return self._data[item]
         
@@ -777,6 +777,10 @@ class ConfigNode(MutableMapping):
             self._trigger_save()
         else:
             raise KeyError(f"Key '{key}' not found.")
+
+    def has_top_level_key(self, key):
+        """检查一个键是否存在于当前节点的顶层。"""
+        return key in self._data
 
     def __iter__(self):
         """遍历所有子项。"""
