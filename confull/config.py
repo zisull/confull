@@ -3,6 +3,7 @@
 # @date: 2024年11月19日
 
 import base64 as _b64  # for Fernet key encoding
+import logging
 import os
 import threading
 from contextlib import contextmanager
@@ -26,6 +27,9 @@ from .node import ConfigNode
 
 ENCRYPT_HEADER = b'ZISULLCONFULLENC'  # encryption header updated
 SALT_SIZE = 8  # 每次保存使用 8 字节随机 salt
+
+# logger
+logger = logging.getLogger(__name__)
 
 
 class Config:
@@ -133,29 +137,37 @@ class Config:
     # 公开方法：数据与元信息导出
     # ------------------------------------------------------------------
     def to_json(self, indent: int = 2):
-        """Return the configuration data in JSON string form."""
-        # orjson only supports 2-space indentation via OPT_INDENT_2; ignore indent param for now.
-        return orjson.dumps(self._data.dict, option=orjson.OPT_INDENT_2).decode("utf-8")
+        """以 JSON 字符串形式返回配置数据。
+
+        参数
+        ----
+        indent : int, 默认 2
+            缩进空格数；`indent==2` 时使用 orjson 提供更快的序列化，
+            其它值则回退至标准库 ``json.dumps``。"""
+        if indent == 2:
+            return orjson.dumps(self._data.dict, option=orjson.OPT_INDENT_2).decode("utf-8")
+        import json
+        return json.dumps(self._data.dict, indent=indent, ensure_ascii=False)
 
     def to_dict(self):
-        """Return a deep (fully expanded) python dict of the config data."""
+        """以 `dict` 形式返回完整展开后的配置数据。"""
         # ConfigNode.dict already returns a deep dict; just proxy it.
         return self._data.dict
 
     def is_auto_save(self) -> bool:
-        """Return whether auto-save is enabled."""
+        """返回当前是否开启自动保存。"""
         return self._auto_save
 
     def set_auto_save(self, flag: bool):
-        """Enable or disable auto-save."""
+        """开启或关闭自动保存。"""
         self._auto_save = bool(flag)
 
     def path(self) -> str:
-        """Return the file path (relative)."""
+        """返回配置文件路径（相对路径）。"""
         return self._file
 
     def abs_path(self) -> str:
-        """Return the absolute file path."""
+        """返回配置文件的绝对路径。"""
         return os.path.abspath(self._file)
 
     # ------------------------------------------------------------------
@@ -250,7 +262,7 @@ class Config:
                     self._data = ConfigNode({}, manager=self)
                     return True
                 except OSError as e:
-                    print(f"清除配置文件 {self._file} 失败：{e}")
+                    logger.warning("清除配置文件 %s 失败：%s", self._file, e)
                     return False
             else:
                 return False
@@ -427,7 +439,7 @@ class Config:
                 # 保存完成后清理锁文件，避免残留 .lock 文件
                 self._cleanup_lock_file()
             except Exception as e:
-                print(f"保存配置文件失败 {self._file}: {e}")
+                logger.error("保存配置文件失败 %s: %s", self._file, e)
 
     def save_to_file(self, file=None, way=None):
         """
@@ -678,9 +690,9 @@ class Config:
         # 重命名内部线程，方便测试与调试 (tests rely on "DirWatcher" 前缀)
         try:
             thr = (
-                getattr(observer, "_thread", None)
-                or getattr(observer, "_observer_thread", None)
-                or getattr(observer, "thread", None)
+                    getattr(observer, "_thread", None)
+                    or getattr(observer, "_observer_thread", None)
+                    or getattr(observer, "thread", None)
             )
             if isinstance(thr, threading.Thread):
                 thr.name = f"DirWatcher-{id(self)}"
