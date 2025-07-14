@@ -6,6 +6,7 @@ import base64 as _b64  # for Fernet key encoding
 import logging
 import os
 import threading
+from functools import lru_cache
 from contextlib import contextmanager
 from pathlib import Path
 from threading import RLock
@@ -39,7 +40,8 @@ class Config:
     """
 
     def __init__(self, data=None, file="config", way="", replace=False,
-                 auto_save=True, pwd=None, process_safe: bool = False):
+                 auto_save=True, pwd=None, process_safe: bool = False,
+                 debounce_ms: int = 0):
         """
         初始化配置管理器。
         :param data: 初始配置数据（dict）
@@ -49,6 +51,7 @@ class Config:
         :param auto_save: 是否自动保存
         :param pwd: 密码字符串，用于加密配置文件
         :param process_safe: 是否进程安全（进程锁）
+        :param debounce_ms: 自动保存延迟（毫秒） 0 则立即保存 (默认) 可用于防止频繁保存性能问题。
         """
         self._file = file
         # 若未指定 way，根据文件扩展名推断
@@ -63,6 +66,8 @@ class Config:
         self._way = self.validate_format(way)
         self._file = self.ensure_extension(file)  # # 调用 ensure_extension 来创建目录和添加扩展名
         self._auto_save = auto_save
+        self._debounce_ms = max(0, debounce_ms)  # 去抖时长 (毫秒)
+        self._save_timer: Optional[threading.Timer] = None
         # 即时保存，无延迟
         self._pwd = pwd  # password string; encryption key derived per save
         self._process_safe = process_safe
@@ -85,21 +90,36 @@ class Config:
                 self._dirty = True  # 强制标记需要保存
             self.save()  # 确保立即保存初始数据
 
+        # 程序退出时确保最后一次写盘
+        import atexit
+        atexit.register(self._flush_save)
+
     # _generate_key 方法已废弃，改为在 _encrypt_data 内部按次生成随机 salt
 
     # ------------------------------------------------------------------
     # Fernet 加密 / 解密
     # ------------------------------------------------------------------
-    def _derive_key(self, salt: bytes) -> bytes:
-        """从密码+salt 派生 32 字节 key 供 Fernet 使用"""
-        assert self._pwd is not None  # 类型检查安全保证
+
+    # ------------------------------------------------------------------
+    # KDF 缓存：减少重复派生开销
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    @lru_cache(maxsize=128)
+    def _cached_kdf(password: str, salt: bytes) -> bytes:
+        """缓存 (password, salt) → Fernet key 派生结果，降低 CPU 开销。"""
         kdf = PBKDF2HMAC(
             algorithm=SHA256(),
             length=32,
             salt=salt,
             iterations=100_000,
         )
-        return _b64.urlsafe_b64encode(kdf.derive(self._pwd.encode()))
+        return _b64.urlsafe_b64encode(kdf.derive(password.encode()))
+
+    def _derive_key(self, salt: bytes) -> bytes:
+        """从密码+salt 获取/派生 32 字节 Fernet key（带缓存）。"""
+        assert self._pwd is not None  # 类型检查安全保证
+        return self._cached_kdf(self._pwd, salt)
 
     def _encrypt_data(self, data):
         """使用 Fernet(AES128 + HMAC) 加密配置数据"""
@@ -166,7 +186,7 @@ class Config:
         """返回配置文件路径（相对路径）。"""
         return self._file
 
-    def abs_path(self) -> str:
+    def path_abs(self) -> str:
         """返回配置文件的绝对路径。"""
         return os.path.abspath(self._file)
 
@@ -247,7 +267,7 @@ class Config:
 
         self._auto_save_if_needed()
 
-    def del_clean(self):
+    def clean_del(self):
         """清空所有配置并删除配置文件。"""
         self.mark_dirty()
         with self._lock:
@@ -411,11 +431,36 @@ class Config:
 
     # 内部：自动保存
     def _auto_save_if_needed(self):
-        if self._auto_save:
+        if not self._auto_save:
+            return
+
+        if self._debounce_ms == 0:
             self.save()
+            return
+
+        # 启动 / 重置计时器
+        if self._save_timer and self._save_timer.is_alive():
+            self._save_timer.cancel()
+
+        self._save_timer = threading.Timer(self._debounce_ms / 1000, self._flush_save)
+        self._save_timer.daemon = True
+        self._save_timer.start()
+
+    # -------------------- 异步保存实现 --------------------
+    def _flush_save(self):
+        """计时器回调：真正执行保存"""
+        try:
+            self.save()
+        finally:
+            self._save_timer = None
 
     def save(self):
         """保存配置到文件。"""
+        # 若有计时器等待，先取消，改为立即保存
+        if self._save_timer and self._save_timer.is_alive():
+            self._save_timer.cancel()
+            self._save_timer = None
+
         with self._lock:
             if not self._dirty:
                 return
@@ -441,7 +486,7 @@ class Config:
             except Exception as e:
                 logger.error("保存配置文件失败 %s: %s", self._file, e)
 
-    def save_to_file(self, file=None, way=None):
+    def to_file(self, file=None, way=None):
         """
         另存为指定文件和格式。
         :param file: 目标文件
@@ -617,7 +662,7 @@ class Config:
 
     _CONF_RESERVED = {
         "to_dict", "to_json", "is_auto_save", "set_auto_save",
-        "path", "abs_path", "save", "save_to_file", "reload", "write", "read",
+        "path", "path_abs", "save", "to_file", "reload", "write", "read", "clean_del",
     }
 
     def _conf_check_reserved(self, key: str):

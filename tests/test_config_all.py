@@ -9,13 +9,13 @@
    - test_overwrite_mode_conflict  : 节点⇄叶子路径冲突处理
 2. 文件持久化
    - test_save_load                : save() + 重新实例化
-   - test_save_to_file             : 另存为不同格式
+   - test_to_file                 : 另存为不同格式
    - test_autosave                 : 自动保存即时落盘
    - test_context_manager          : with 语句自动保存
 3. 删除操作
    - test_del_key_cleanup          : del_key() 自动清理空父节点
-   - test_del_clean_file           : del_clean() 删除文件+清空内存
-   - test_del_clean_in_memory      : 无文件对象的 del_clean()
+   - test_clean_del_file           : clean_del() 删除文件+清空内存
+   - test_clean_del_in_memory      : 无文件对象的 clean_del()
 4. 多格式与加密
    - test_initialization_formats   : 支持 toml/json/yaml/ini/xml
    - test_encryption_workflow      : 加密/解密与密码校验
@@ -63,7 +63,7 @@ class BasicConfigTests(unittest.TestCase):
         # 清理生成的文件
         for f in self.test_files:
             if os.path.exists(f):
-                Config(file=f).del_clean()
+                Config(file=f).clean_del()
         self.test_files.clear()
 
     # ------------------------------------------------------------------
@@ -132,12 +132,12 @@ class BasicConfigTests(unittest.TestCase):
         new_cfg = Config(file=filename)
         self.assertEqual(new_cfg.a, 1)
 
-    def test_save_to_file(self):
+    def test_to_file(self):
         """另存为不同格式并保持数据一致"""
         file1, file2 = 'save_as_1.toml', 'save_as_2.json'
         self.test_files += [file1, file2]
         cfg = Config({'k': 'v'}, file=file1, replace=True)
-        cfg.save_to_file(file2, way='json')
+        cfg.to_file(file2, way='json')
         self.assertEqual(Config(file=file2, way='json').k, 'v')
 
     def test_autosave(self):
@@ -167,19 +167,19 @@ class BasicConfigTests(unittest.TestCase):
         self.assertNotIn('a', cfg.to_dict())
         self.assertEqual(cfg.d, 2)
 
-    def test_del_clean_file(self):
-        """del_clean() 删除文件并清空内存"""
+    def test_clean_del_file(self):
+        """clean_del() 删除文件并清空内存"""
         filename = 'del_file.toml'
         self.test_files.append(filename)
         cfg = Config({'x': 1}, file=filename, replace=True)
-        cfg.del_clean()
+        cfg.clean_del()
         self.assertFalse(os.path.exists(filename))
         self.assertEqual(len(cfg), 0)
 
-    def test_del_clean_in_memory(self):
-        """无文件对象的 del_clean()"""
+    def test_clean_del_in_memory(self):
+        """无文件对象的 clean_del()"""
         cfg = Config({'p': 9})
-        cfg.del_clean()
+        cfg.clean_del()
         self.assertEqual(cfg.to_dict(), {})
 
 
@@ -193,7 +193,7 @@ class FormatEncryptionTests(unittest.TestCase):
             file = f'init.{fmt}'
             cfg = Config({'sec': {'k': 'v'}}, file=file, way=fmt, replace=True)
             self.assertEqual(Config(file=file, way=fmt).sec.k, 'v')
-            cfg.del_clean()
+            cfg.clean_del()
 
     def test_encryption_workflow(self):
         """正确密码解密 / 错误密码失败"""
@@ -237,7 +237,7 @@ class AdvancedFeatureTests(unittest.TestCase):
                 th.join(timeout=0.2)
         for f in self.tmp_files:
             if os.path.exists(f):
-                Config(file=f).del_clean()
+                Config(file=f).clean_del()
         self.tmp_files.clear()
 
     def test_reload_external_change(self):

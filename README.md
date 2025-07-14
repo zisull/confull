@@ -23,7 +23,7 @@
 - 线程安全
 - 支持文件变更监听 (`enable_watch` / `disable_watch`)，外部修改后自动重载
 - 进程安全：可选 `portalocker` 跨进程锁 (`process_safe=False` 默认关闭，可设为 True 以跨进程安全)
-- 数据优先：即使键名与内部方法同名（如 `to_dict`、`data`），也可安全读写
+- 键名冲突防护：若顶层键名与内部接口同名（如 `to_dict`、`clean_del` 等）将抛出 `AttributeError`，避免意外覆盖
 - 自动补全（Autovivification）：链式赋值时自动创建中间节点
 
 ### 变更说明
@@ -58,7 +58,7 @@ print(cc.read('db.host'))  # 127.0.0.1
 print(cc.read('db.port'))  # 3306
 
 # 4. dict方式批量赋值
-cc.dict = {'user': 'root', 'password': 'pass'}
+cc.set_data({'user': 'root', 'password': 'pass'})
 print(cc['user'])  # root
 
 # 5. 属性方式赋值和读取
@@ -75,17 +75,17 @@ print(cc.read('email'))  # a@b.com
 print(cc.read('db.host'))  # localhost
 
 # 8. 清空并删除配置文件
-cc.del_clean()
+cc.clean_del()
 
 # 9. 另存为其他格式
 cc = Config({'user': 'admin'}, file='a.toml', way='toml')
-cc.save_to_file(file='a.yaml', way='yaml')
+cc.to_file(file='a.yaml', way='yaml')
 
 # 若不再需要监听，可关闭
 cfg.disable_watch()
 
 # 进程安全开关示例（高级场景）
-cfg_safe = Config(file='shared.toml', process_safe=True)   # 默认即安全
+cfg_safe = Config(file='shared.toml', process_safe=True)  # 默认即安全
 cfg_fast = Config(file='shared.toml', process_safe=False)  # 关闭进程锁，单进程场景
 ```
 
@@ -126,37 +126,22 @@ def __init__(self,
 - 新增参数 `pwd`，用于加密配置文件。
 - 已移除参数 `backup`。
 
-#### 属性
+#### 核心方法速查
 
-| 属性名          | 描述                                                   |
-| --------------- | ------------------------------------------------------ |
-| `json`          | 以 json 字符串格式返回配置数据。                       |
-| `dict`          | 以 `dict` 格式返回配置数据，也可用于批量设置配置数据。 |
-| `auto_save`     | 是否自动保存，可读写属性。                             |
-| `process_safe`  | 是否启用跨进程锁；`True` 进程安全，`False` 禁用加速。 |
-| `str`           | 以字符串格式返回配置数据。                             |
-| `file_path`     | 配置文件路径。                                         |
-| `file_path_abs` | 配置文件绝对路径。                                     |
-
-#### 方法
-
-| 方法名                                                 | 描述                                                         |
-| ------------------------------------------------------ | ------------------------------------------------------------ |
-| `read(key: str, default=None)`                         | 读取配置项，支持点号路径，如 `a.b.c`。若配置项不存在，返回默认值。 |
-| `write(key: str, value, overwrite_mode: bool = False)` | 写入配置项，支持点号路径。若 `overwrite_mode` 为 `True`，路径冲突时会覆盖。写入后若 `auto_save` 为 `True`，则自动保存。 |
-| `del_clean()`                                          | 清空所有配置并删除配置文件。                                 |
-| `update(data: dict)`                                   | 批量更新配置项，支持点号路径。更新后若 `auto_save` 为 `True`，则自动保存。 |
-| `set_data(data: dict)`                                 | 用 `dict` 完全替换配置数据。替换后若 `auto_save` 为 `True`，则自动保存。 |
-| `del_key(key: str)`                                    | 删除指定配置项，支持点号路径。删除后若 `auto_save` 为 `True`，则自动保存。 |
-| `_load()`                                              | 从文件加载配置，内部方法。                                   |
-| `load(file: str = None, way: str = None)`              | 切换配置文件或格式（不自动加载内容）。                       |
-| `mark_dirty()`                                         | 标记配置已更改。                                             |
-| `save()`                                               | 保存配置到文件。                                             |
-| `save_to_file(file: str = None, way: str = None)`      | 另存为指定文件和格式。                                       |
-| `_ensure_file_exists()`                                | 确保配置文件存在，内部方法。                                 |
-| `_recursive_update(original, new_data)`                | 递归更新配置，支持点号路径，内部方法。                       |
-| `validate_format(_way)`                                | 校验并返回合法格式名，静态方法。                             |
-| `ensure_extension(file)`                               | 确保文件名有正确扩展名。                                     |
+| 方法 | 说明 |
+|------|------|
+| `read(key, default=None)` | 读取键，支持点路径 |
+| `write(key, value, *, overwrite_mode=False)` | 写入键；标量↔️字典冲突须 `overwrite_mode=True` |
+| `update(dict_like)` | 批量写入（点路径支持） |
+| `del_key(key)` | 删除键 |
+| `clean_del()` | 清空并删除配置文件 |
+| `to_dict()` | 返回深拷贝 `dict` 数据 |
+| `to_json(indent=2)` | JSON 字符串 |
+| `is_auto_save()` / `set_auto_save(flag)` | 获取 / 设置自动保存状态 |
+| `path()` / `path_abs()` | 相对 / 绝对路径 |
+| `save()` | 立即保存（忽略去抖） |
+| `to_file(file, way)` | 另存为其它文件 / 格式 |
+| `enable_watch()` / `disable_watch()` | 开 / 关文件监听 |
 
 #### 魔法方法
 
@@ -177,4 +162,50 @@ def __init__(self,
 
 ---
 
-zisull@qq.com
+## 四、使用技巧与注意事项
+
+### 4.1 常见注意事项
+
+1. **键名冲突** – 顶层键若与 `_CONF_RESERVED` 列表冲突会抛 `AttributeError`；若必须使用类似名字，请放到子节点中，如 `meta.to_dict`。
+2. **去抖延迟** – 频繁写场景请设置 `debounce_ms`（毫秒）。0 表示立即保存；100–500 ms 可显著降低磁盘 I/O。
+3. **进程锁 vs 性能** – `process_safe=True` 可避免多进程竞争，但在单进程密集写时略微降低速度；可按需关闭。
+4. **加密不可逆** – 丢失密码将无法解密；文件被篡改会触发 HMAC 校验错误并拒绝加载。
+5. **watchdog** – 监听线程以 `DirWatcher-<id>` 命名；在单元测试结束应 `disable_watch()` 关闭，避免残留线程。
+
+### 4.2 高级示例
+
+```python
+from confull import Config
+
+# 1) 加密 + 去抖保存（100 ms），支持 toml
+cfg = Config({'token': 'abc'}, file='secure.toml', pwd='secret', debounce_ms=100)
+cfg.write('log.level', 'INFO')
+
+# 2) 上下文批量操作
+with Config(file='batch.yaml', auto_save=False) as c:
+    c.set_data({'app': {'ver': '1.2'}, 'features': ['x', 'y']})
+    c.to_file('backup.json', way='json')  # 退出时自动 save()
+
+# 3) 开启文件监听
+cfg_watch = Config(file='live.toml')
+cfg_watch.enable_watch()
+
+# 4) 进程安全共享配置
+shared = Config(file='shared.toml', process_safe=True)
+# ... 跨进程读写
+
+# 5) 清理
+shared.clean_del()
+```
+
+### 4.3 玩法小技巧
+
+* **链式赋值** – `cfg.app.version.build = 5` 可一次性创建深层键。
+* **函数式读取** – `value = cfg('a.b', default=0)` 等价于 `cfg.read(...)`，适合快速取值。
+* **混合更新** – `update({'a': 1, 'b.c': 2})` 同时支持顶层与点路径键。
+* **动态格式切换** – 任意时刻可 `cfg.load(file='x.yaml', way='yaml')` 改写目标文件与格式。
+* **安全回收** – `clean_del()` 在单元测试或临时文件场景快速清理磁盘与内存。
+* **只读模式** – 将配置文件权限设为只读，仍可使用 `read()` 快速获取数据；写入将抛出异常，可用于生产只读节点。
+* **跨模块共享** – 在不同模块中 `Config(file='same.toml')` 打开同一文件，实现配置中心。
+
+---
