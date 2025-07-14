@@ -34,7 +34,7 @@ class Config:
     支持密码加密保护。
     """
 
-    def __init__(self, data=None, file="config", way="toml", replace=False,
+    def __init__(self, data=None, file="config", way="", replace=False,
                  auto_save=True, pwd=None, process_safe: bool = False):
         """
         初始化配置管理器。
@@ -47,6 +47,14 @@ class Config:
         :param process_safe: 是否进程安全（进程锁）
         """
         self._file = file
+        # 若未指定 way，根据文件扩展名推断
+        if way == "":
+            ext = Path(file).suffix.lstrip('.').lower()
+            try:
+                way = Format.from_str(ext).value
+            except ValueError:
+                way = "toml"
+
         # Support str or Format for `way`
         self._way = self.validate_format(way)
         self._file = self.ensure_extension(file)  # # 调用 ensure_extension 来创建目录和添加扩展名
@@ -121,45 +129,44 @@ class Config:
         except Exception as e:
             raise ValueError(f"解密失败: {e}") from e
 
-    @property
-    def json(self):
-        """以 JSON 字符串格式返回配置数据。"""
-        return orjson.dumps(self.dict, option=orjson.OPT_INDENT_2).decode('utf-8')
+    # ------------------------------------------------------------------
+    # 公开方法：数据与元信息导出
+    # ------------------------------------------------------------------
+    def to_json(self, indent: int = 2):
+        """Return the configuration data in JSON string form."""
+        # orjson only supports 2-space indentation via OPT_INDENT_2; ignore indent param for now.
+        return orjson.dumps(self._data.dict, option=orjson.OPT_INDENT_2).decode("utf-8")
 
-    @property
-    def dict(self):
-        """以 dict 格式返回配置数据。"""
+    def to_dict(self):
+        """Return a deep (fully expanded) python dict of the config data."""
+        # ConfigNode.dict already returns a deep dict; just proxy it.
         return self._data.dict
 
-    @dict.setter
-    def dict(self, value):
-        """用 dict 批量设置配置数据。"""
-        self.set_data(value)
-
-    @property
-    def auto_save(self):
-        """是否自动保存。"""
+    def is_auto_save(self) -> bool:
+        """Return whether auto-save is enabled."""
         return self._auto_save
 
-    @auto_save.setter
-    def auto_save(self, value):
-        """设置自动保存。"""
-        self._auto_save = value
+    def set_auto_save(self, flag: bool):
+        """Enable or disable auto-save."""
+        self._auto_save = bool(flag)
 
-    @property
-    def str(self):
-        """以字符串格式返回配置数据。"""
-        return str(self.dict)
-
-    @property
-    def file_path(self):
-        """配置文件路径。"""
+    def path(self) -> str:
+        """Return the file path (relative)."""
         return self._file
 
-    @property
-    def file_path_abs(self):
-        """配置文件绝对路径。"""
+    def abs_path(self) -> str:
+        """Return the absolute file path."""
         return os.path.abspath(self._file)
+
+    # ------------------------------------------------------------------
+    # 魔法方法
+    # ------------------------------------------------------------------
+    def __str__(self):
+        """Human-readable string representation."""
+        return str(self._data.dict)
+
+    def __repr__(self):
+        return repr(self._data.dict)
 
     def read(self, key, default=None):
         """
@@ -194,26 +201,36 @@ class Config:
         for k in keys[:-1]:
             if isinstance(node, ConfigNode):
                 child = node.data.get(k)
-                if not isinstance(child, (dict, ConfigNode)):
+                # 如果 child 不存在，自动创建空 dict
+                if child is None:
+                    node[k] = {}
+                elif not isinstance(child, (dict, ConfigNode)):
                     if overwrite_mode:
-                        node[k] = {}  # 创建一个新 section
+                        node[k] = {}
                     else:
                         raise KeyError(
-                            f"Key '{k}' is not a section or does not exist. Use overwrite_mode=True to create."
+                            f"路径 '{k}' 不是可写分区，或不存在；如需自动创建，请设置 overwrite_mode=True。"
                         )
             else:
                 # This should not be reached if self._data is always a ConfigNode
                 raise AttributeError(
-                    f"Expected ConfigNode, but got {type(node)}. This indicates an internal error."
+                    f"内部错误：预期 ConfigNode，实际得到 {type(node)}。"
                 )
 
             node = getattr(node, k)
 
-        # 检查最后一个键是否存在，如果存在且 overwrite_mode 为 False，则报错
-        if not overwrite_mode and keys[-1] in node.data:
-            raise ValueError(
-                f"Key '{keys[-1]}' already exists. Use overwrite_mode=True to overwrite.")
+        # 如果目标键已存在
+        if keys[-1] in node.data:
+            existing_val = node.data[keys[-1]]
+            # 若存在“叶子↔节点”结构冲突才需要 overwrite_mode
+            type_conflict = isinstance(existing_val, (dict, ConfigNode)) ^ isinstance(value, (dict, ConfigNode))
+            if type_conflict and not overwrite_mode:
+                raise ValueError(
+                    f"路径冲突：键 '{keys[-1]}' 类型不兼容；如需覆盖，请设置 overwrite_mode=True。"
+                )
 
+        # Before setting final key, check reserved
+        self._conf_check_reserved(keys[-1])
         setattr(node, keys[-1], value)
 
         self._auto_save_if_needed()
@@ -244,7 +261,20 @@ class Config:
         :param data: dict，支持点号路径
         """
         self.mark_dirty()
-        self._recursive_update(self._data.data, data)
+        for key, value in data.items():
+            if '.' in key:
+                keys = key.split('.')
+                current = self._data.data
+                for k in keys[:-1]:
+                    current = current.setdefault(k, {})
+                current[keys[-1]] = value
+            elif isinstance(value, dict) and isinstance(self._data.data.get(key, None), dict):
+                self._recursive_update(self._data.data[key], value)
+            else:
+                self._conf_check_reserved(key)
+                if self._data.data.get(key) != value:
+                    self._data.data[key] = value
+                    self.mark_dirty()
         self._auto_save_if_needed()
 
     def set_data(self, data):
@@ -253,6 +283,8 @@ class Config:
         :param data: 新配置 dict
         """
         self.mark_dirty()
+        for top_key in data.keys():
+            self._conf_check_reserved(str(top_key))
         self._data = ConfigNode(data, manager=self)
         self._auto_save_if_needed()
 
@@ -506,14 +538,6 @@ class Config:
             path = path.with_suffix(f".{self._way}")
         return str(path)
 
-    def __str__(self):
-        """str(self)"""
-        return str(self.dict)
-
-    def __repr__(self):
-        """repr(self)"""
-        return repr(self.dict)
-
     def __getattr__(self, item):
         """属性访问代理到配置数据，优先访问配置键。"""
         # 优先在配置字典中查找 `item`，以解决配置键与内部属性（如 'data'）的命名冲突。
@@ -538,13 +562,13 @@ class Config:
                     # To align with getattr behavior, allow autovivification on read
                     # This is a bit controversial, but makes access consistent.
                     # Let's see if tests pass. For now, raise.
-                    raise KeyError(f"Key '{item}' not found.")
+                    raise KeyError(f"路径 '{item}' 不存在。")
             elif isinstance(node, dict):
                 node = node.get(k)
                 if node is None:
-                    raise KeyError(f"Key '{item}' not found.")
+                    raise KeyError(f"路径 '{item}' 不存在。")
             else:
-                raise KeyError(f"Key '{item}' not found.")
+                raise KeyError(f"路径 '{item}' 不存在。")
 
         if isinstance(node, dict):
             return ConfigNode(node, manager=self)
@@ -579,11 +603,22 @@ class Config:
         """上下文管理器 exit，自动保存。"""
         self.save()
 
+    _CONF_RESERVED = {
+        "to_dict", "to_json", "is_auto_save", "set_auto_save",
+        "path", "abs_path", "save", "save_to_file", "reload", "write", "read",
+    }
+
+    def _conf_check_reserved(self, key: str):
+        """检查顶层键是否为保留关键字。若是则抛出异常。"""
+        if key in self._CONF_RESERVED:
+            raise AttributeError(f"关键字 '{key}' 为保留接口名称，禁止覆盖。请使用其他名称。")
+
     def __setattr__(self, key, value):
-        """属性赋值代理到配置数据，内部属性用 _ 前缀。"""
         if key.startswith('_'):
             super().__setattr__(key, value)
         else:
+            # 检查保留关键字
+            self._conf_check_reserved(key)
             setattr(self._data, key, value)
 
     def __delattr__(self, key):

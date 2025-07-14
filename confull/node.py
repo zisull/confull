@@ -37,7 +37,7 @@ class ConfigNode(MutableMapping):
     # -----------------------------------------------------
     def __setitem__(self, key: str, value: Any):
         if key in self._RESERVED:
-            raise AttributeError(f"Cannot set reserved keyword '{key}' as a config item.")
+            raise AttributeError(f"关键字 '{key}' 为保留名称，禁止写入。")
         if isinstance(value, dict):
             value = ConfigNode(value, manager=self._manager, parent=self, key_in_parent=key)
         self._data[key] = value

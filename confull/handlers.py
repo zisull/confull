@@ -74,10 +74,19 @@ class INIConfigHandler(ConfigHandler):
 
     def save(self, data: Dict[str, Any], file: IO):
         parser = configparser.ConfigParser()
-        if not any(isinstance(v, dict) for v in data.values()):
-            data = {"Default": data}
-        for section, section_data in data.items():
-            parser[section] = {k: str(v) for k, v in section_data.items()}
+        default_storage: Dict[str, str] = {}
+
+        for key, value in data.items():
+            if isinstance(value, dict):
+                # 普通 section
+                parser[key] = {k: str(v) for k, v in value.items()}
+            else:
+                # 直接量放入 DEFAULT 段
+                default_storage[key] = str(value)
+
+        if default_storage:
+            parser['默认'] = default_storage  # type: ignore[index]
+
         parser.write(file)  # type: ignore[arg-type]
 
 
