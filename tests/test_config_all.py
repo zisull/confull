@@ -258,11 +258,19 @@ class AdvancedFeatureTests(unittest.TestCase):
 
     def test_write_conflicts(self):
         """节点/叶子冲突检测"""
-        cfg = Config({'u': 'leaf'})
+        cfg = Config()
+        # 标量 → 节点：应先报错，再覆盖成功
+        cfg.write('u', 'leaf')
         with self.assertRaises(KeyError):
-            cfg.write('u.k', 1, overwrite_mode=False)
+            cfg.write('u.k', 1)
         cfg.write('u.k', 1, overwrite_mode=True)
         self.assertEqual(cfg.u.k, 1)
+
+        # 节点 → 标量：应先报错，再覆盖成功
+        with self.assertRaises(ValueError):
+            cfg.write('u', 999)
+        cfg.write('u', 999, overwrite_mode=True)
+        self.assertEqual(cfg.u, 999)
 
     def test_dunder_methods(self):
         """魔法方法综合校验"""
@@ -290,9 +298,9 @@ class AdvancedFeatureTests(unittest.TestCase):
         Path(file).write_text('ver = 1')
         cfg = Config(file=file)
         cfg.enable_watch()
-        time.sleep(0.3)
+        time.sleep(0.5)
         Path(file).write_text('ver = 2')
-        time.sleep(0.3)
+        time.sleep(0.6)
         self.assertEqual(cfg.ver, 2)
         cfg.disable_watch()
 
