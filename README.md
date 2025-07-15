@@ -43,19 +43,19 @@ cfg.enable_watch()
 
 # 1. 普通用法
 cc = Config()
-cc.write('user', 'admin')
-print(cc.read('user'))  # admin
+cc.set('user', 'admin')
+print(cc.get('user'))  # admin
 
 # 2. 加密用法
 cc = Config(file='secure.toml', way='toml', pwd='123456')
-cc.write('token', 'xyz')
-print(cc.read('token'))  # xyz
+cc.set('token', 'xyz')
+print(cc.get('token'))  # xyz
 
 # 3. 点路径写入和读取
-cc.write('db.host', '127.0.0.1', overwrite_mode=True)
-cc.write('db.port', 3306, overwrite_mode=True)
-print(cc.read('db.host'))  # 127.0.0.1
-print(cc.read('db.port'))  # 3306
+cc.set('db.host', '127.0.0.1', overwrite_mode=True)
+cc.set('db.port', 3306, overwrite_mode=True)
+print(cc.get('db.host'))  # 127.0.0.1
+print(cc.get('db.port'))  # 3306
 
 # 4. dict方式批量赋值
 cc.set_data({'user': 'root', 'password': 'pass'})
@@ -67,12 +67,12 @@ print(cc.site)  # mysite
 
 # 6. 删除配置项
 cc.del_key('user')
-print(cc.read('user'))  # None
+print(cc.get('user'))  # None
 
 # 7. 批量更新
 cc.update({'email': 'a@b.com', 'db.host': 'localhost'})
-print(cc.read('email'))  # a@b.com
-print(cc.read('db.host'))  # localhost
+print(cc.get('email'))  # a@b.com
+print(cc.get('db.host'))  # localhost
 
 # 8. 清空并删除配置文件
 cc.clean_del()
@@ -130,8 +130,8 @@ def __init__(self,
 
 | 方法 | 说明 |
 |------|------|
-| `read(key, default=None)` | 读取键，支持点路径 |
-| `write(key, value, *, overwrite_mode=False)` | 写入键；标量↔️字典冲突须 `overwrite_mode=True` |
+| `get(key, default=None)` | 读取键，支持点路径 |
+| `set(key, value, *, overwrite_mode=False)` | 写入键；标量↔️字典冲突须 `overwrite_mode=True` |
 | `update(dict_like)` | 批量写入（点路径支持） |
 | `del_key(key)` | 删除键 |
 | `clean_del()` | 清空并删除配置文件 |
@@ -150,7 +150,7 @@ def __init__(self,
 | `__del__()`                                 | 对象销毁时，若 `auto_save` 为 `True`，会自动保存配置。 |
 | `__getattr__(self, item)`                   | 属性访问代理到配置数据。                               |
 | `__getitem__(self, item)`                   | `dict` 方式访问配置数据。                              |
-| `__call__(self, key, value=None)`           | `cc(key)` 等价于 `cc.read(key, value)`。               |
+| `__call__(self, key, value=None)`           | `cc(key)` 等价于 `cc.get(key, value)`。               |
 | `__len__(self)`                             | 配置项数量。                                           |
 | `__iter__(self)`                            | 遍历配置项。                                           |
 | `__contains__(self, item)`                  | 判断配置项是否存在。                                   |
@@ -179,7 +179,7 @@ from confull import Config
 
 # 1) 加密 + 去抖保存（100 ms），支持 toml
 cfg = Config({'token': 'abc'}, file='secure.toml', pwd='secret', debounce_ms=100)
-cfg.write('log.level', 'INFO')
+cfg.set('log.level', 'INFO')
 
 # 2) 上下文批量操作
 with Config(file='batch.yaml', auto_save=False) as c:
@@ -201,11 +201,11 @@ shared.clean_del()
 ### 4.3 玩法小技巧
 
 * **链式赋值** – `cfg.app.version.build = 5` 可一次性创建深层键。
-* **函数式读取** – `value = cfg('a.b', default=0)` 等价于 `cfg.read(...)`，适合快速取值。
+* **函数式读取** – `value = cfg('a.b', default=0)` 等价于 `cfg.get(...)`，适合快速取值。
 * **混合更新** – `update({'a': 1, 'b.c': 2})` 同时支持顶层与点路径键。
 * **动态格式切换** – 任意时刻可 `cfg.load(file='x.yaml', way='yaml')` 改写目标文件与格式。
 * **安全回收** – `clean_del()` 在单元测试或临时文件场景快速清理磁盘与内存。
-* **只读模式** – 将配置文件权限设为只读，仍可使用 `read()` 快速获取数据；写入将抛出异常，可用于生产只读节点。
+* **只读模式** – 将配置文件权限设为只读，仍可使用 `get()` 快速获取数据；写入将抛出异常，可用于生产只读节点。
 * **跨模块共享** – 在不同模块中 `Config(file='same.toml')` 打开同一文件，实现配置中心。
 
 ---

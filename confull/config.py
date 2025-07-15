@@ -10,7 +10,7 @@ from functools import lru_cache
 from contextlib import contextmanager
 from pathlib import Path
 from threading import RLock
-from typing import Optional, Any
+from typing import Optional, Any, Union
 
 import orjson
 import portalocker  # process-level file locking
@@ -65,6 +65,8 @@ class Config:
         # Support str or Format for `way`
         self._way = self.validate_format(way)
         self._file = self.ensure_extension(file)  # # 调用 ensure_extension 来创建目录和添加扩展名
+        # 统一使用绝对路径，避免 cwd 变化导致文件写入到意外位置
+        self._file = os.path.abspath(self._file)
         self._auto_save = auto_save
         self._debounce_ms = max(0, debounce_ms)  # 去抖时长 (毫秒)
         self._save_timer: Optional[threading.Timer] = None
@@ -200,7 +202,7 @@ class Config:
     def __repr__(self):
         return repr(self._data.dict)
 
-    def read(self, key, default=None):
+    def get(self, key, default=None):
         """
         读取配置项，支持点号路径。
         :param key: 配置项路径（如 a.b.c）
@@ -219,7 +221,7 @@ class Config:
                 return default
         return node
 
-    def write(self, key, value, overwrite_mode=False):
+    def set(self, key, value, overwrite_mode=False):
         """
         写入配置项，支持点号路径。
         :param key: 配置项路径
@@ -254,7 +256,7 @@ class Config:
         # 如果目标键已存在
         if keys[-1] in node.data:
             existing_val = node.data[keys[-1]]
-            # 若存在“叶子↔节点”结构冲突才需要 overwrite_mode
+            # 若存在"叶子↔节点"结构冲突才需要 overwrite_mode
             type_conflict = isinstance(existing_val, (dict, ConfigNode)) ^ isinstance(value, (dict, ConfigNode))
             if type_conflict and not overwrite_mode:
                 raise ValueError(
@@ -632,8 +634,8 @@ class Config:
         return node
 
     def __call__(self, key, value=None):
-        """cc(key) 等价于 cc.read(key, value)"""
-        return self.read(key, value)
+        """cc(key) 等价于 cc.get(key, value)"""
+        return self.get(key, value)
 
     def __len__(self):
         """配置项数量。"""
@@ -646,7 +648,7 @@ class Config:
     def __contains__(self, item):
         """判断配置项是否存在，支持点路径。"""
         sentinel = object()
-        return self.read(item, sentinel) is not sentinel
+        return self.get(item, sentinel) is not sentinel
 
     def __bool__(self):
         """配置是否非空。"""
@@ -662,7 +664,7 @@ class Config:
 
     _CONF_RESERVED = {
         "to_dict", "to_json", "is_auto_save", "set_auto_save",
-        "path", "path_abs", "save", "to_file", "reload", "write", "read", "clean_del",
+        "path", "path_abs", "save", "to_file", "reload", "set", "get", "clean_del",
     }
 
     def _conf_check_reserved(self, key: str):
@@ -683,13 +685,13 @@ class Config:
         if key.startswith('_'):
             super().__delattr__(key)
         else:
-            # 使用 read 来检查key是否存在，以避免触发__getattr__的自动创建
+            # 使用 get 来检查key是否存在，以避免触发__getattr__的自动创建
             try:
-                self.read(key)
+                self.get(key)
                 # key 存在，可以删除
                 self.del_key(key)
             except (KeyError, AttributeError):
-                # read 失败会抛出 KeyError, 如果路径无效则可能 AttributeError
+                # get 失败会抛出 KeyError, 如果路径无效则可能 AttributeError
                 raise AttributeError(f"'Config' object has no attribute '{key}'")
 
     def __setitem__(self, key, value):
@@ -717,9 +719,25 @@ class Config:
         class _Handler(FileSystemEventHandler):
             def __init__(self, manager: "Config"):
                 self._manager = manager
+                # 预先缓存目标文件的规范化绝对路径，避免频繁构造
+                self._target_path = Path(manager._file).resolve()
+
+            def _is_target(self, src_path: Union[str, bytes]) -> bool:
+                """判断事件路径是否为目标文件（跨平台大小写/分隔符兼容）。"""
+                # 确保为 str
+                if isinstance(src_path, bytes):
+                    try:
+                        src_path = src_path.decode(errors='ignore')
+                    except Exception:
+                        return False
+                try:
+                    return Path(src_path).resolve() == self._target_path
+                except Exception:
+                    # 回退到字符串粗略比较
+                    return os.path.abspath(src_path) == os.path.abspath(str(self._target_path))
 
             def on_modified(self, event):  # type: ignore
-                if event.src_path == self._manager._file:
+                if self._is_target(event.src_path):
                     self._manager.reload()
 
             # 有些编辑器写文件会触发 moved/created

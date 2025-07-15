@@ -16,7 +16,7 @@ graph TD
 
 ## 2. 核心能力
 
-1. **点路径读写** – `cfg.write('a.b.c', 1)` / `cfg.read('a.b.c')`
+1. **点路径读写** – `cfg.set('a.b.c', 1)` / `cfg.get('a.b.c')`
 2. **自动补全** – `cfg.app.version = '1.0'` 时自动创建缺失层级
 3. **键名冲突防护** – 顶层键若与内部接口冲突会抛异常，保障核心方法安全
 4. **自动保存** – 任何变更立即持久化 (除非 `auto_save=False`)
@@ -31,7 +31,7 @@ graph TD
 |安装依赖|`pip install confull`|
 |导入|`from confull import Config`|
 | 安全读取 (带默认) | `value = cfg('path.to.key', default)` |
-| 强制写入/覆盖 | `cfg.write('x.y', 1, overwrite_mode=True)` |
+| 强制写入/覆盖 | `cfg.set('x.y', 1, overwrite_mode=True)` |
 | 批量更新 | `cfg.update({'a.b': 1, 'c': 2})` |
 | 保存为其它格式 | `cfg.to_file('conf.json', way='json')` |
 | 临时上下文 | `with Config(file='tmp.toml') as c: ...` |
