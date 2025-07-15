@@ -269,7 +269,7 @@ class Config:
 
         self._auto_save_if_needed()
 
-    def clean_del(self):
+    def del_clean(self):
         """清空所有配置并删除配置文件。"""
         self.mark_dirty()
         with self._lock:
@@ -664,7 +664,7 @@ class Config:
 
     _CONF_RESERVED = {
         "to_dict", "to_json", "is_auto_save", "set_auto_save",
-        "path", "path_abs", "save", "to_file", "reload", "set", "get", "clean_del",
+        "path", "path_abs", "save", "to_file", "reload", "set", "get", "del_clean",
     }
 
     def _conf_check_reserved(self, key: str):

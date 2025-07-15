@@ -23,7 +23,7 @@
 - 线程安全
 - 支持文件变更监听 (`enable_watch` / `disable_watch`)，外部修改后自动重载
 - 进程安全：可选 `portalocker` 跨进程锁 (`process_safe=False` 默认关闭，可设为 True 以跨进程安全)
-- 键名冲突防护：若顶层键名与内部接口同名（如 `to_dict`、`clean_del` 等）将抛出 `AttributeError`，避免意外覆盖
+- 键名冲突防护：若顶层键名与内部接口同名（如 `to_dict`、`del_clean` 等）将抛出 `AttributeError`，避免意外覆盖
 - 自动补全（Autovivification）：链式赋值时自动创建中间节点
 
 ### 变更说明
@@ -75,7 +75,7 @@ print(cc.get('email'))  # a@b.com
 print(cc.get('db.host'))  # localhost
 
 # 8. 清空并删除配置文件
-cc.clean_del()
+cc.del_clean()
 
 # 9. 另存为其他格式
 cc = Config({'user': 'admin'}, file='a.toml', way='toml')
@@ -134,7 +134,7 @@ def __init__(self,
 | `set(key, value, *, overwrite_mode=False)` | 写入键；标量↔️字典冲突须 `overwrite_mode=True` |
 | `update(dict_like)` | 批量写入（点路径支持） |
 | `del_key(key)` | 删除键 |
-| `clean_del()` | 清空并删除配置文件 |
+| `del_clean()` | 清空并删除配置文件 |
 | `to_dict()` | 返回深拷贝 `dict` 数据 |
 | `to_json(indent=2)` | JSON 字符串 |
 | `is_auto_save()` / `set_auto_save(flag)` | 获取 / 设置自动保存状态 |
@@ -195,7 +195,7 @@ shared = Config(file='shared.toml', process_safe=True)
 # ... 跨进程读写
 
 # 5) 清理
-shared.clean_del()
+shared.del_clean()
 ```
 
 ### 4.3 玩法小技巧
@@ -204,7 +204,7 @@ shared.clean_del()
 * **函数式读取** – `value = cfg('a.b', default=0)` 等价于 `cfg.get(...)`，适合快速取值。
 * **混合更新** – `update({'a': 1, 'b.c': 2})` 同时支持顶层与点路径键。
 * **动态格式切换** – 任意时刻可 `cfg.load(file='x.yaml', way='yaml')` 改写目标文件与格式。
-* **安全回收** – `clean_del()` 在单元测试或临时文件场景快速清理磁盘与内存。
+* **安全回收** – `del_clean()` 在单元测试或临时文件场景快速清理磁盘与内存。
 * **只读模式** – 将配置文件权限设为只读，仍可使用 `get()` 快速获取数据；写入将抛出异常，可用于生产只读节点。
 * **跨模块共享** – 在不同模块中 `Config(file='same.toml')` 打开同一文件，实现配置中心。
 

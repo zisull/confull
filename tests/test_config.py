@@ -26,7 +26,7 @@ import time
 import unittest
 from pathlib import Path
 
-from confull import Config, Format
+from confull import Config
 
 # watchdog 是可选依赖，若未安装则相关测试自动跳过
 try:
@@ -90,7 +90,7 @@ class TempDirTestCase(unittest.TestCase):
 class BasicBehaviourTests(TempDirTestCase):
     """基础增删改查相关测试。"""
 
-    def test_多接口读写一致(self):
+    def test_multi_interface_rw(self):
         """通过 set / 属性 / 下标 三种方式读写，应返回一致结果。"""
         cfg = Config({"db": {"host": "localhost"}}, file=self._f("basic.toml"))
         # set/get
@@ -103,19 +103,19 @@ class BasicBehaviourTests(TempDirTestCase):
         cfg["db.password"] = "secret"
         self.assertEqual(cfg["db.password"], "secret")
 
-    def test_update_批量更新(self):
+    def test_update_batch(self):
         cfg = Config({"app": {"name": "demo"}})
         cfg.update({"app": {"name": "new"}, "debug": True})
         self.assertEqual(cfg.app.name, "new")
         self.assertTrue(cfg.debug)
 
-    def test_leaf_overwrite_同键覆盖(self):
+    def test_leaf_overwrite(self):
         cfg = Config()
         cfg.set("value", 1)
         cfg.set("value", 2)  # 不需要 overwrite_mode
         self.assertEqual(cfg.value, 2)
 
-    def test_overwrite_mode_conflict_节点叶子冲突(self):
+    def test_overwrite_mode_conflict(self):
         cfg = Config()
         # 叶子 → 节点
         cfg.set("x", 1)
@@ -136,25 +136,25 @@ class BasicBehaviourTests(TempDirTestCase):
 class PersistenceTests(TempDirTestCase):
     """保存 / 加载 / 格式转换 / 去抖相关测试。"""
 
-    def test_save_load_数据持久化(self):
+    def test_save_and_load(self):
         fn = self._f("save_load.toml")
         Config({"k": "v"}, file=fn).save()
         self.assertEqual(Config(file=fn).k, "v")
 
-    def test_to_file_格式转换(self):
+    def test_to_file_conversion(self):
         toml_path = self._f("a.toml")
         json_path = self._f("a.json")
         Config({"x": 1}, file=toml_path).to_file(json_path, way="json")
         self.assertEqual(Config(file=json_path, way="json").x, 1)
 
-    def test_auto_save_去抖保存(self):
+    def test_auto_save_debounce(self):
         fn = self._f("debounce.toml")
         cfg = Config({}, file=fn, debounce_ms=50)  # 50ms 去抖
         cfg.msg = "hi"
         time.sleep(0.1)  # > 50ms
         self.assertEqual(Config(file=fn).msg, "hi")
 
-    def test_context_manager_自动保存(self):
+    def test_context_manager_autosave(self):
         fn = self._f("ctx.toml")
         with Config(file=fn, auto_save=False) as c:
             c.token = 123
@@ -168,22 +168,22 @@ class PersistenceTests(TempDirTestCase):
 class DeleteOperationTests(TempDirTestCase):
     """键删除与文件清理相关测试。"""
 
-    def test_del_key_清理空父节点(self):
+    def test_del_key_cleanup(self):
         cfg = Config({"a": {"b": {"c": 1}}, "d": 2})
         cfg.del_key("a.b.c")
         self.assertNotIn("a", cfg.to_dict())
         self.assertEqual(cfg.d, 2)
 
-    def test_clean_del_删除文件与内存(self):
+    def test_del_clean_file_and_memory(self):
         fn = self._f("del.toml")
         c = Config({"x": 1}, file=fn)
-        c.clean_del()
+        c.del_clean()
         self.assertFalse(os.path.exists(fn))
         self.assertEqual(len(c), 0)
 
-    def test_clean_del_无文件对象(self):
+    def test_del_clean_in_memory(self):
         cfg = Config({"p": 9})
-        cfg.clean_del()
+        cfg.del_clean()
         self.assertEqual(cfg.to_dict(), {})
 
 # ===========================================================
@@ -194,13 +194,14 @@ class DeleteOperationTests(TempDirTestCase):
 class FormatEncryptionTests(TempDirTestCase):
     """多格式读写与 Fernet 加密测试。"""
 
-    def test_initialization_多格式一致(self):
+    def test_initialization_formats(self):
         for ext in ["toml", "json", "yaml", "ini", "xml"]:
             fn = self._f(f"file.{ext}")
             cfg = Config({"sec": {"k": "v"}}, file=fn, way=ext, replace=True)
             self.assertEqual(Config(file=fn, way=ext).sec.k, "v")
+            cfg.del_clean()
 
-    def test_encryption_workflow_密码正确错误(self):
+    def test_encryption_workflow(self):
         fn = self._f("secure.toml")
         pwd = "pwd"
         Config({"s": "1"}, file=fn, pwd=pwd).save()
@@ -208,7 +209,7 @@ class FormatEncryptionTests(TempDirTestCase):
         with self.assertRaises(Exception):
             Config(file=fn, pwd="bad")
 
-    def test_decryption_tampered_篡改报错(self):
+    def test_decryption_tampered(self):
         fn = self._f("tampered.toml")
         pwd = "p"
         Config({"x": "y"}, file=fn, pwd=pwd).save()
@@ -229,7 +230,7 @@ class FormatEncryptionTests(TempDirTestCase):
 class ProcessSafeTests(TempDirTestCase):
     """跨进程安全及临时文件清理。"""
 
-    def test_process_safe_flag_数据同步(self):
+    def test_process_safe_flag(self):
         fn = self._f("proc.toml")
         cfg1 = Config({"v": 1}, file=fn)
         cfg2 = Config(file=fn, process_safe=False)  # 关闭锁
@@ -238,13 +239,13 @@ class ProcessSafeTests(TempDirTestCase):
         cfg1.reload()
         self.assertEqual(cfg1.v, 2)
 
-    def test_transactional_save_tmp_自动清理(self):
+    def test_transactional_save_tmp_cleanup(self):
         fn = self._f("txn.toml")
         cfg = Config({"x": 1}, file=fn)
         cfg.save()
         self.assertFalse(os.path.exists(fn + ".tmp"))
 
-    def test_default_no_lock_file_默认无锁文件(self):
+    def test_default_no_lock_file(self):
         fn = self._f("nolock.toml")
         Config({"x": 1}, file=fn).save()
         self.assertFalse(os.path.exists(fn + ".lock"))
@@ -258,7 +259,7 @@ class WatchdogTests(TempDirTestCase):
     """需要 watchdog 才运行的文件监控测试。"""
 
     @unittest.skipUnless(WATCHDOG_AVAILABLE, "watchdog 未安装")
-    def test_file_watcher_自动重载(self):
+    def test_file_watcher_reload(self):
         fn = self._f("watch.toml")
         Path(fn).write_text("ver = 1")
         cfg = Config(file=fn)
@@ -275,7 +276,7 @@ class WatchdogTests(TempDirTestCase):
             cfg.disable_watch()
 
     @unittest.skipUnless(WATCHDOG_AVAILABLE, "watchdog 未安装")
-    def test_watchdog_thread_naming_前缀(self):
+    def test_watchdog_thread_naming(self):
         fn = self._f("th.toml")
         cfg = Config(file=fn)
         cfg.enable_watch()
@@ -293,12 +294,12 @@ class WatchdogTests(TempDirTestCase):
 class AdvancedFeatureTests(TempDirTestCase):
     """保留关键字保护 / 魔法方法整合等。"""
 
-    def test_reserved_keywords_block_不可覆盖(self):
+    def test_reserved_keywords_block(self):
         cfg = Config()
         with self.assertRaises(AttributeError):
             cfg.to_dict = "bad"  # type: ignore[attr-defined]
 
-    def test_write_conflicts_节点叶子双向(self):
+    def test_write_conflicts(self):
         cfg = Config()
         # 标量 → 节点
         cfg.set("u", "leaf")
@@ -311,7 +312,7 @@ class AdvancedFeatureTests(TempDirTestCase):
         cfg.set("u", 999, overwrite_mode=True)
         self.assertEqual(cfg.u, 999)
 
-    def test_dunder_methods_综合(self):
+    def test_dunder_methods(self):
         cfg = Config({"a": 1, "b": {"c": 2}})
         self.assertTrue("a" in cfg and "b.c" in cfg and "x" not in cfg)
         self.assertEqual(len(cfg), 2)
