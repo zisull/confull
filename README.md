@@ -12,9 +12,11 @@
 
 ## 一、概述
 
-`confull` 是一款多格式配置管理工具，支持在 `dict` 与 `ini`、`xml`、`json`、`toml`、`yaml` 等格式之间进行读写操作，并能自动保存配置。提供便捷的接口管理配置数据，并可根据需求灵活切换配置文件和格式。
+`confull` 是一款多格式配置管理工具，支持在 `dict` 与 `ini`、`xml`、`json`、`toml`、`yaml`
+等格式之间进行读写操作，并能自动保存配置。提供便捷的接口管理配置数据，并可根据需求灵活切换配置文件和格式。
 
 ### 主要特性
+
 - 支持多种配置文件格式：json、toml、yaml、ini、xml
 - 支持 dict <=> 配置文件的自动转换
 - 支持点号路径（如 a.b.c）方式的访问和写入
@@ -81,6 +83,13 @@ cc.del_clean()
 cc = Config({'user': 'admin'}, file='a.toml', way='toml')
 cc.to_file(file='a.yaml', way='yaml')
 
+# 10. 解决键名冲突 (.opt)
+# 当配置项名称与 Config 内置方法（如 save, path, items 等）冲突时
+cc = Config({'save': True, 'path': '/tmp'})
+# print(cc.save)       # ❌ 错误：这是 save() 方法
+print(cc.opt.save)     # ✅ 正确：这是 'save' 配置项 -> True
+cc.opt.path = '/var'   # ✅ 正确：安全修改冲突键
+
 # 若不再需要监听，可关闭
 cfg.disable_watch()
 
@@ -123,42 +132,44 @@ def __init__(self,
              pwd: str | None = None,
              process_safe: bool = False):
 ```
+
 - 新增参数 `pwd`，用于加密配置文件。
 - 已移除参数 `backup`。
 
 #### 核心方法速查
 
-| 方法 | 说明 |
-|------|------|
-| `get(key, default=None)` | 读取键，支持点路径 |
+| 方法                                         | 说明                                  |
+|--------------------------------------------|-------------------------------------|
+| `get(key, default=None)`                   | 读取键，支持点路径                           |
 | `set(key, value, *, overwrite_mode=False)` | 写入键；标量↔️字典冲突须 `overwrite_mode=True` |
-| `update(dict_like)` | 批量写入（点路径支持） |
-| `del_key(key)` | 删除键 |
-| `del_clean()` | 清空并删除配置文件 |
-| `to_dict()` | 返回深拷贝 `dict` 数据 |
-| `to_json(indent=2)` | JSON 字符串 |
-| `is_auto_save()` / `set_auto_save(flag)` | 获取 / 设置自动保存状态 |
-| `path()` / `path_abs()` | 相对 / 绝对路径 |
-| `save()` | 立即保存（忽略去抖） |
-| `to_file(file, way)` | 另存为其它文件 / 格式 |
-| `enable_watch()` / `disable_watch()` | 开 / 关文件监听 |
+| `update(dict_like)`                        | 批量写入（点路径支持）                         |
+| `del_key(key)`                             | 删除键                                 |
+| `del_clean()`                              | 清空并删除配置文件                           |
+| `to_dict()`                                | 返回深拷贝 `dict` 数据                     |
+| `to_json(indent=2)`                        | JSON 字符串                            |
+| `is_auto_save()` / `set_auto_save(flag)`   | 获取 / 设置自动保存状态                       |
+| `path()` / `path_abs()`                    | 相对 / 绝对路径                           |
+| `save()`                                   | 立即保存（忽略去抖）                          |
+| `to_file(file, way)`                       | 另存为其它文件 / 格式                        |
+| `enable_watch()` / `disable_watch()`       | 开 / 关文件监听                           |
+| `opt`                                      | 纯净数据代理，安全访问冲突键（如 `cfg.opt.save`） |
 
 #### 魔法方法
 
-| 魔法方法名                                  | 描述                                                   |
-| ------------------------------------------- | ------------------------------------------------------ |
+| 魔法方法名                                       | 描述                                    |
+|---------------------------------------------|---------------------------------------|
 | `__del__()`                                 | 对象销毁时，若 `auto_save` 为 `True`，会自动保存配置。 |
-| `__getattr__(self, item)`                   | 属性访问代理到配置数据。                               |
-| `__getitem__(self, item)`                   | `dict` 方式访问配置数据。                              |
-| `__call__(self, key, value=None)`           | `cc(key)` 等价于 `cc.get(key, value)`。               |
-| `__len__(self)`                             | 配置项数量。                                           |
-| `__iter__(self)`                            | 遍历配置项。                                           |
-| `__contains__(self, item)`                  | 判断配置项是否存在。                                   |
-| `__bool__(self)`                            | 配置是否非空。                                         |
-| `__enter__(self)`                           | 上下文管理器 `enter`。                                 |
-| `__exit__(self, exc_type, exc_val, exc_tb)` | 上下文管理器 `exit`，自动保存。                        |
-| `__setattr__(self, key, value)`             | 属性赋值代理到配置数据，内部属性用 `_` 前缀。          |
-| `__delattr__(self, key)`                    | 属性删除代理到配置数据。                               |
+| `__getattr__(self, item)`                   | 属性访问代理到配置数据。                          |
+| `__getitem__(self, item)`                   | `dict` 方式访问配置数据。                      |
+| `__call__(self, key, value=None)`           | `cc(key)` 等价于 `cc.get(key, value)`。   |
+| `__len__(self)`                             | 配置项数量。                                |
+| `__iter__(self)`                            | 遍历配置项。                                |
+| `__contains__(self, item)`                  | 判断配置项是否存在。                            |
+| `__bool__(self)`                            | 配置是否非空。                               |
+| `__enter__(self)`                           | 上下文管理器 `enter`。                       |
+| `__exit__(self, exc_type, exc_val, exc_tb)` | 上下文管理器 `exit`，自动保存。                   |
+| `__setattr__(self, key, value)`             | 属性赋值代理到配置数据，内部属性用 `_` 前缀。             |
+| `__delattr__(self, key)`                    | 属性删除代理到配置数据。                          |
 
 ---
 
@@ -166,7 +177,7 @@ def __init__(self,
 
 ### 4.1 常见注意事项
 
-1. **键名冲突** – 顶层键若与 `_CONF_RESERVED` 列表冲突会抛 `AttributeError`；若必须使用类似名字，请放到子节点中，如 `meta.to_dict`。
+1. **键名冲突** – 顶层键若与 `_CONF_RESERVED` 列表冲突会抛 `AttributeError`；建议使用 `.opt` 属性访问（如 `cfg.opt.save`），或将其放到子节点中。
 2. **去抖延迟** – 频繁写场景请设置 `debounce_ms`（毫秒）。0 表示立即保存；100–500 ms 可显著降低磁盘 I/O。
 3. **进程锁 vs 性能** – `process_safe=True` 可避免多进程竞争，但在单进程密集写时略微降低速度；可按需关闭。
 4. **加密不可逆** – 丢失密码将无法解密；文件被篡改会触发 HMAC 校验错误并拒绝加载。

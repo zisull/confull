@@ -6,6 +6,7 @@ import base64 as _b64  # for Fernet key encoding
 import logging
 import os
 import threading
+import atexit
 from functools import lru_cache
 from contextlib import contextmanager
 from pathlib import Path
@@ -17,9 +18,8 @@ import portalocker  # process-level file locking
 from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives.hashes import SHA256
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-from watchdog.events import FileSystemEventHandler  # type: ignore
-# Mandatory watchdog dependency (no longer optional)
-from watchdog.observers import Observer  # type: ignore
+from watchdog.events import FileSystemEventHandler
+from watchdog.observers import Observer
 
 from .formats import Format
 from .handlers import ConfigHandlerFactory
@@ -31,6 +31,43 @@ SALT_SIZE = 8  # 每次保存使用 8 字节随机 salt
 
 # logger
 logger = logging.getLogger(__name__)
+
+
+class _DataProxy:
+    """
+    纯净的数据代理，没有任何公共方法（除了部分魔术方法），只有数据访问。
+    用于解决配置项名称与 Config 类方法名冲突的问题。
+    """
+    def __init__(self, node):
+        # 使用 object.__setattr__ 避免触发自己的 __setattr__
+        object.__setattr__(self, "_node", node)
+
+    def __getattr__(self, key):
+        return self._node[key]
+
+    def __setattr__(self, key, value):
+        self._node[key] = value
+
+    def __getitem__(self, key):
+        return self._node[key]
+
+    def __setitem__(self, key, value):
+        self._node[key] = value
+
+    def __delitem__(self, key):
+        del self._node[key]
+
+    def __iter__(self):
+        return iter(self._node)
+
+    def __len__(self):
+        return len(self._node)
+
+    def __contains__(self, key):
+        return key in self._node
+
+    def __repr__(self):
+        return repr(self._node)
 
 
 class Config:
@@ -53,10 +90,10 @@ class Config:
         :param process_safe: 是否进程安全（进程锁）
         :param debounce_ms: 自动保存延迟（毫秒） 0 则立即保存 (默认) 可用于防止频繁保存性能问题。
         """
-        self._file = file
+        self._file_path = Path(file)
         # 若未指定 way，根据文件扩展名推断
         if way == "":
-            ext = Path(file).suffix.lstrip('.').lower()
+            ext = self._file_path.suffix.lstrip('.').lower()
             try:
                 way = Format.from_str(ext).value
             except ValueError:
@@ -64,9 +101,10 @@ class Config:
 
         # Support str or Format for `way`
         self._way = self.validate_format(way)
-        self._file = self.ensure_extension(file)  # # 调用 ensure_extension 来创建目录和添加扩展名
+        self._file_path = self.ensure_extension(self._file_path)  # # 调用 ensure_extension 来创建目录和添加扩展名
         # 统一使用绝对路径，避免 cwd 变化导致文件写入到意外位置
-        self._file = os.path.abspath(self._file)
+        self._file_path = self._file_path.resolve()
+        
         self._auto_save = auto_save
         self._debounce_ms = max(0, debounce_ms)  # 去抖时长 (毫秒)
         self._save_timer: Optional[threading.Timer] = None
@@ -83,7 +121,7 @@ class Config:
         self._watch_dummy_stop: Optional[threading.Event] = None
         self._watch_dummy_thread: Optional[threading.Thread] = None
 
-        if os.path.exists(self._file) and not replace:
+        if self._file_path.exists() and not replace:
             self._load()
         else:
             # 当文件不存在时，无论replace参数如何都使用data初始化
@@ -93,8 +131,15 @@ class Config:
             self.save()  # 确保立即保存初始数据
 
         # 程序退出时确保最后一次写盘
-        import atexit
         atexit.register(self._flush_save)
+    
+    @property
+    def opt(self):
+        """
+        返回一个纯净的数据访问接口，避免与 save/load 等方法冲突。
+        使用 config.opt.key 访问配置项。
+        """
+        return _DataProxy(self._data)
 
     # _generate_key 方法已废弃，改为在 _encrypt_data 内部按次生成随机 salt
 
@@ -186,11 +231,11 @@ class Config:
 
     def path(self) -> str:
         """返回配置文件路径（相对路径）。"""
-        return self._file
+        return str(self._file_path)
 
     def path_abs(self) -> str:
         """返回配置文件的绝对路径。"""
-        return os.path.abspath(self._file)
+        return str(self._file_path.absolute())
 
     # ------------------------------------------------------------------
     # 魔法方法
@@ -273,18 +318,18 @@ class Config:
         """清空所有配置并删除配置文件。"""
         self.mark_dirty()
         with self._lock:
-            if os.path.exists(self._file):
+            if self._file_path.exists():
                 try:
-                    os.remove(self._file)
+                    self._file_path.unlink()
                     # 同时删除锁文件
                     if self._process_safe:
                         lock_path = self._lock_path()
-                        if os.path.exists(lock_path):
-                            os.remove(lock_path)
+                        if lock_path.exists():
+                            lock_path.unlink()
                     self._data = ConfigNode({}, manager=self)
                     return True
                 except OSError as e:
-                    logger.warning("清除配置文件 %s 失败：%s", self._file, e)
+                    logger.warning("清除配置文件 %s 失败：%s", self._file_path, e)
                     return False
             else:
                 return False
@@ -367,7 +412,7 @@ class Config:
         with self._lock, self._process_lock(shared=True):
             try:
                 # 统一用二进制模式预读，以判断是否加密
-                with open(self._file, 'rb') as f:
+                with self._file_path.open('rb') as f:
                     raw_data = f.read()
 
                 # 如果文件为空，则初始化为空配置
@@ -386,7 +431,7 @@ class Config:
                     # 对于明文文件，根据 handler 的模式选择正确的读写方式
                     read_mode = 'r' + self._handler.mode
                     encoding = 'utf-8' if 'b' not in read_mode else None
-                    with open(self._file, read_mode, encoding=encoding) as f2:
+                    with self._file_path.open(read_mode, encoding=encoding) as f2:
                         loaded_data = self._handler.load(f2)
                     self._data = ConfigNode(loaded_data, manager=self)
 
@@ -403,7 +448,7 @@ class Config:
         """
         self._load()
         self._dirty = False
-        print(f"配置已从 {self._file} 重新加载。")
+        print(f"配置已从 {self._file_path} 重新加载。")
 
     def load(self, file=None, way=None):
         """
@@ -412,7 +457,7 @@ class Config:
         :param way: 新格式
         """
         if file:
-            self._file = file
+            self._file_path = Path(file).resolve()
         if way:
             self._way = way.lower()
             self._handler = ConfigHandlerFactory.get_handler(self._way)
@@ -468,8 +513,8 @@ class Config:
                 return
             try:
                 # 写入前校验：如果文件存在且为加密文件，进行校验
-                if os.path.exists(self._file):
-                    with open(self._file, 'rb') as f:
+                if self._file_path.exists():
+                    with self._file_path.open('rb') as f:
                         # 只读取头部来判断是否加密，避免读取整个大文件
                         header = f.read(len(ENCRYPT_HEADER))
                         if header == ENCRYPT_HEADER:
@@ -481,12 +526,12 @@ class Config:
                             except Exception as e:
                                 raise ValueError(f'加密文件校验失败，拒绝写入！原因：{e}')
 
-                self._write_to_file(self._file, self._way)
+                self._write_to_file(self._file_path, self._way)
                 self._dirty = False
                 # 保存完成后清理锁文件，避免残留 .lock 文件
                 self._cleanup_lock_file()
             except Exception as e:
-                logger.error("保存配置文件失败 %s: %s", self._file, e)
+                logger.error("保存配置文件失败 %s: %s", self._file_path, e)
 
     def to_file(self, file=None, way=None):
         """
@@ -494,7 +539,7 @@ class Config:
         :param file: 目标文件
         :param way: 目标格式
         """
-        target_file = self.ensure_extension(file) if file else self._file
+        target_file = self.ensure_extension(Path(file)) if file else self._file_path
         target_way = self.validate_format(way) if way else self._way
         with self._lock:
             self._write_to_file(target_file, target_way)
@@ -502,16 +547,17 @@ class Config:
             self._cleanup_lock_file()
         print(f"配置已成功另存到 {target_file}")
 
-    def _write_to_file(self, target_file, target_way):
+    def _write_to_file(self, target_file: Path, target_way):
         """
         将配置数据写入指定文件和格式的核心逻辑。
-        :param target_file: 目标文件路径
+        :param target_file: 目标文件路径 (Path object)
         :param target_way: 目标文件格式
         """
         target_handler = ConfigHandlerFactory.get_handler(target_way)
         self._ensure_file_exists(file_path=target_file)
 
-        temp_path = f"{target_file}.tmp"
+        # 临时文件
+        temp_path = target_file.with_name(f"{target_file.name}.tmp")
         try:
             with self._process_lock(shared=False):
                 config_data = self._data.dict
@@ -519,34 +565,35 @@ class Config:
                 # 1. 写入临时文件
                 if self._pwd:
                     encrypted_data = self._encrypt_data(config_data)
-                    with open(temp_path, 'wb') as f:
+                    with temp_path.open('wb') as f:
                         f.write(encrypted_data)
                         f.flush()
                         os.fsync(f.fileno())
                 else:
                     mode = 'w' + target_handler.mode
                     encoding = 'utf-8' if 'b' not in mode else None
-                    with open(temp_path, mode, encoding=encoding) as f:
+                    with temp_path.open(mode, encoding=encoding) as f:
                         target_handler.save(config_data, f)
                         f.flush()
                         os.fsync(f.fileno())
 
                 # 2. 原子替换
-                os.replace(temp_path, target_file)
+                # Path.replace 在 Windows 3.8+ 也支持原子替换（调用 MoveFileEx）
+                temp_path.replace(target_file)
 
         except Exception as e:
             # 清理残留的临时文件
             try:
-                if os.path.exists(temp_path):
-                    os.remove(temp_path)
+                if temp_path.exists():
+                    temp_path.unlink()
             except OSError:
                 pass
             # 重新抛出异常，让调用方处理
             raise IOError(f"写入文件 {target_file} 失败: {e}") from e
 
-    def _ensure_file_exists(self, file_path: Optional[str] = None):
+    def _ensure_file_exists(self, file_path: Optional[Path] = None):
         """确保配置文件存在。"""
-        path = Path(file_path or self._file)
+        path = file_path or self._file_path
         if not path.exists():
             try:
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -581,21 +628,20 @@ class Config:
             return _way.value
         return Format.from_str(str(_way)).value
 
-    def ensure_extension(self, file):
+    def ensure_extension(self, path: Path) -> Path:
         """确保文件名有正确扩展名，并创建必要的目录。"""
-        path = Path(file)
         # 创建目录（如果有）
         if path.parent and not path.parent.exists():
             try:
                 path.parent.mkdir(parents=True, exist_ok=True)
             except OSError as e:
                 print(f"创建目录 {path.parent} 失败: {e}")
-                return str(path)
+                return path
 
         # 添加扩展名
         if path.suffix == "":
             path = path.with_suffix(f".{self._way}")
-        return str(path)
+        return path
 
     def __getattr__(self, item):
         """属性访问代理到配置数据，优先访问配置键。"""
@@ -665,6 +711,7 @@ class Config:
     _CONF_RESERVED = {
         "to_dict", "to_json", "is_auto_save", "set_auto_save",
         "path", "path_abs", "save", "to_file", "reload", "set", "get", "del_clean",
+        "opt",  # Add opt to reserved
     }
 
     def _conf_check_reserved(self, key: str):
@@ -720,7 +767,7 @@ class Config:
             def __init__(self, manager: "Config"):
                 self._manager = manager
                 # 预先缓存目标文件的规范化绝对路径，避免频繁构造
-                self._target_path = Path(manager._file).resolve()
+                self._target_path = manager._file_path.resolve()
 
             def _is_target(self, src_path: Union[str, bytes]) -> bool:
                 """判断事件路径是否为目标文件（跨平台大小写/分隔符兼容）。"""
@@ -734,7 +781,7 @@ class Config:
                     return Path(src_path).resolve() == self._target_path
                 except Exception:
                     # 回退到字符串粗略比较
-                    return os.path.abspath(src_path) == os.path.abspath(str(self._target_path))
+                    return str(Path(src_path).absolute()) == str(self._target_path)
 
             def on_modified(self, event):  # type: ignore
                 if self._is_target(event.src_path):
@@ -746,7 +793,7 @@ class Config:
 
         handler = _Handler(self)
         observer = Observer()
-        observer.schedule(handler, Path(self._file).parent.as_posix(), recursive=False)
+        observer.schedule(handler, self._file_path.parent.as_posix(), recursive=False)
         observer.daemon = True
         observer.start()
 
@@ -798,8 +845,8 @@ class Config:
     # ------------------------------------------------------------------
     # 进程锁
     # ------------------------------------------------------------------
-    def _lock_path(self) -> str:
-        return f"{self._file}.lock"
+    def _lock_path(self) -> Path:
+        return self._file_path.with_name(self._file_path.name + ".lock")
 
     @contextmanager
     def _process_lock(self, shared: bool = False):
@@ -811,10 +858,9 @@ class Config:
         lock_flags = portalocker.LOCK_SH if shared else portalocker.LOCK_EX
         # 使用锁文件而非目标文件，避免某些编辑器先删除再写导致锁失效
         lock_path = self._lock_path()
-        path_obj = Path(lock_path)
-        if not path_obj.exists():
-            path_obj.touch()
-        with portalocker.Lock(lock_path, flags=lock_flags):
+        if not lock_path.exists():
+            lock_path.touch()
+        with portalocker.Lock(str(lock_path), flags=lock_flags):
             yield
 
     # ------------------------------------------------------------------
@@ -826,9 +872,8 @@ class Config:
             return
         lock_path = self._lock_path()
         try:
-            os.remove(lock_path)
-        except FileNotFoundError:
-            pass  # 已不存在
+            if lock_path.exists():
+                lock_path.unlink()
         except OSError:
             # 在某些平台上如果文件仍被占用，删除可能失败，忽略即可
             pass
