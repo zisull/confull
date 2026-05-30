@@ -37,7 +37,7 @@ class ConfigNode(MutableMapping):
     # -----------------------------------------------------
     def __setitem__(self, key: str, value: Any):
         if key in self._RESERVED:
-            raise AttributeError(f"Cannot set reserved keyword '{key}' as a config item.")
+            raise AttributeError(f"关键字 '{key}' 为保留名称，禁止写入。")
         if isinstance(value, dict):
             value = ConfigNode(value, manager=self._manager, parent=self, key_in_parent=key)
         self._data[key] = value
@@ -132,6 +132,41 @@ class ConfigNode(MutableMapping):
     def __str__(self) -> str:  # pragma: no cover
         """可读性更好的字符串表示，显示展开后的字典。"""
         return str(self._expand())
+
+    # -----------------------------------------------------
+    # 运算符支持
+    # -----------------------------------------------------
+    def __or__(self, other: Any) -> Dict[str, Any]:
+        """支持 | 运算符合并配置，返回新的 dict。"""
+        if isinstance(other, ConfigNode):
+            other_data = other._expand()
+        elif isinstance(other, dict):
+            other_data = other
+        else:
+            return NotImplemented
+        result = self._expand()
+        result.update(other_data)
+        return result
+
+    def __ror__(self, other: Any) -> Dict[str, Any]:
+        """支持 | 运算符（左侧为 dict）。"""
+        if isinstance(other, dict):
+            result = other.copy()
+            result.update(self._expand())
+            return result
+        return NotImplemented
+
+    def __ior__(self, other: Any) -> "ConfigNode":
+        """支持 |= 运算符，原地合并。"""
+        if isinstance(other, ConfigNode):
+            other_data = other._expand()
+        elif isinstance(other, dict):
+            other_data = other
+        else:
+            return NotImplemented
+        self._data.update(other_data)
+        self._trigger_save()
+        return self
 
     # -----------------------------------------------------
     def _trigger_save(self):
