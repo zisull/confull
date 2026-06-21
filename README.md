@@ -5,7 +5,7 @@
 
 > 一个轻量级、功能强大的多格式配置管理工具
 
-[![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/Python-3.9+-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 **ConfuLL** 让配置管理变得简单直观。它支持 dict 与 json/toml/yaml/ini/xml 之间的无缝转换，提供属性访问、点路径操作、自动保存、加密保护等丰富功能。
