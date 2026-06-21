@@ -93,9 +93,9 @@ class ConfigNode(MutableMapping):
         if key in self._RESERVED:
             raise AttributeError(key)
 
-        # 若不存在则自动创建子节点，实现链式赋值 autovivification
+        # 若不存在则抛出异常，避免 hasattr() 永远返回 True
         if key not in self._data:
-            self.__setitem__(key, {}) # 使用 __setitem__ 来创建，确保能触发保存
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{key}'")
         return self.__getitem__(key)
 
     def __setattr__(self, key: str, value: Any):

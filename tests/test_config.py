@@ -28,6 +28,7 @@ import unittest
 from pathlib import Path
 
 from confull import Config
+from confull import ConfigError, ConfigIOError, ConfigValidationError, ConfigEncryptionError
 from confull.node import ConfigNode
 
 try:
@@ -122,7 +123,7 @@ class BasicReadWriteTests(TempDirTestCase):
         """测试覆盖模式。"""
         cfg = Config(file=self._f('overwrite.toml'))
         cfg.set('x', 1)
-        with self.assertRaises(KeyError):
+        with self.assertRaises(ConfigValidationError):
             cfg.set('x.y', 2)
         cfg.set('x.y', 2, overwrite_mode=True)
 
@@ -130,7 +131,7 @@ class BasicReadWriteTests(TempDirTestCase):
         """测试叶子节点转字典节点冲突。"""
         cfg = Config(file=self._f('conflict.toml'))
         cfg.set('value', 'leaf')
-        with self.assertRaises(KeyError):
+        with self.assertRaises(ConfigValidationError):
             cfg.set('value.key', 'node')
         cfg.set('value.key', 'node', overwrite_mode=True)
 
@@ -138,7 +139,7 @@ class BasicReadWriteTests(TempDirTestCase):
         """测试字典节点转叶子节点冲突。"""
         cfg = Config(file=self._f('conflict2.toml'))
         cfg.set('dict', {'key': 'value'})
-        with self.assertRaises(ValueError):
+        with self.assertRaises(ConfigValidationError):
             cfg.set('dict', 'leaf')
         cfg.set('dict', 'leaf', overwrite_mode=True)
 
@@ -178,7 +179,7 @@ class PersistenceTests(TempDirTestCase):
         cfg = Config({'a': 1}, file=fn, auto_save=False)
         cfg.b = 2
         cfg2 = Config(file=fn)
-        self.assertNotEqual(cfg2.b, 2)
+        self.assertIsNone(cfg2.get('b'))
 
     def test_context_manager(self):
         """测试上下文管理器。"""
@@ -315,14 +316,14 @@ class EncryptionTests(TempDirTestCase):
             data[30:40] = b'0' * 10
             f.seek(0)
             f.write(data)
-        with self.assertRaises(ValueError):
+        with self.assertRaises(ConfigEncryptionError):
             Config(file=fn, pwd='p')
 
     def test_no_password_for_encrypted_file(self):
         """测试不提供密码访问加密文件。"""
         fn = self._f('nopwd.toml')
         Config({'secret': 'data'}, file=fn, pwd='key').save()
-        with self.assertRaises(ValueError):
+        with self.assertRaises(ConfigEncryptionError):
             Config(file=fn)
 
 
@@ -425,13 +426,13 @@ class ConvenienceMethodTests(TempDirTestCase):
     def test_require_missing(self):
         """测试 require 不存在时抛出异常。"""
         cfg = Config(file=self._f('req2.toml'))
-        with self.assertRaises(KeyError):
+        with self.assertRaises(ConfigValidationError):
             cfg.require('missing_key')
 
     def test_require_none_value(self):
         """测试 require 值为 None 时抛出异常。"""
         cfg = Config({'key': None}, file=self._f('req3.toml'))
-        with self.assertRaises(KeyError):
+        with self.assertRaises(ConfigValidationError):
             cfg.require('key')
 
     def test_require_nested(self):
@@ -524,7 +525,7 @@ class MergeTests(TempDirTestCase):
     def test_merge_invalid_strategy(self):
         """测试无效合并策略。"""
         cfg = Config(file=self._f('merge_invalid.toml'))
-        with self.assertRaises(ValueError):
+        with self.assertRaises(ConfigValidationError):
             cfg.merge({'a': 1}, strategy='invalid')
 
 
@@ -681,7 +682,7 @@ class AdvancedFeatureTests(TempDirTestCase):
     def test_reserved_keywords(self):
         """测试保留关键字保护。"""
         cfg = Config(file=self._f('reserved.toml'))
-        with self.assertRaises(AttributeError):
+        with self.assertRaises(ConfigValidationError):
             cfg.to_dict = 'bad'
 
     def test_opt_property(self):

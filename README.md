@@ -275,7 +275,7 @@ cfg = Config('secure.toml', pwd='my-secret-password')
 print(cfg.token)  # "abc123"
 
 # 错误密码会抛出异常
-cfg = Config('secure.toml', pwd='wrong')  # ValueError
+cfg = Config('secure.toml', pwd='wrong')  # ConfigEncryptionError
 ```
 
 ### 文件监听
@@ -362,7 +362,7 @@ cfg.to_file('backup.txt', way='toml')
 
 | 方法 | 说明 |
 |------|------|
-| `path()` | 获取文件路径（相对） |
+| `path()` | 获取文件路径（绝对） |
 | `path_abs()` | 获取文件路径（绝对） |
 | `is_auto_save()` | 是否自动保存 |
 | `set_auto_save(flag)` | 设置自动保存 |
@@ -525,12 +525,12 @@ require(key: str) -> Any
 cfg = Config({'database_url': 'sqlite:///db.sqlite'})
 
 cfg.require('database_url')  # 返回 'sqlite:///db.sqlite'
-cfg.require('api_key')       # 抛出 KeyError: "必需的配置项 'api_key' 不存在或值为 None"
+cfg.require('api_key')       # 抛出 ConfigValidationError: "必需的配置项 'api_key' 不存在或值为 None"
 ```
 
 **预期效果：**
 - 存在时返回值
-- 不存在或值为 None 时抛出 KeyError
+- 不存在或值为 None 时抛出 ConfigValidationError
 
 ---
 
