@@ -16,6 +16,7 @@ pip install confull
 
 ```python
 from confull import Config
+from confull import ConfigError, ConfigIOError, ConfigValidationError, ConfigEncryptionError
 ```
 
 ### 1.2 最小可用示例
@@ -51,7 +52,10 @@ Config(
     auto_save: bool = True,      # 是否自动保存
     pwd: str = None,             # 加密密码（None表示不加密）
     process_safe: bool = False,  # 是否启用进程锁
-    debounce_ms: int = 0         # 自动保存去抖延迟（毫秒）
+    debounce_ms: int = 0,        # 自动保存去抖延迟（毫秒）
+    env: str = None,             # 环境名称（如 'dev', 'production'）
+    env_prefix: str = "",        # 环境变量前缀（如 'APP'）
+    schema: dict = None          # 类型验证 schema（如 {'port': int}）
 )
 ```
 
@@ -67,6 +71,9 @@ Config(
 | `pwd` | str/None | None | 非空时启用Fernet加密 |
 | `process_safe` | bool | False | True时使用portalocker进程锁 |
 | `debounce_ms` | int | 0 | >0时延迟保存，减少频繁IO |
+| `env` | str/None | None | 环境名称，自动加载 app.{env}.toml |
+| `env_prefix` | str | "" | 环境变量前缀，自动导入 {prefix}* 环境变量 |
+| `schema` | dict/None | None | 类型验证，格式如 {'port': int, 'debug': bool} |
 
 ### 2.3 格式推断规则
 
@@ -77,7 +84,32 @@ Config(
 4. way 为空 + 无扩展名 → 默认 toml，添加 .toml 扩展名
 ```
 
-### 2.4 常见构造方式
+### 2.4 格式特性
+
+| 格式 | 嵌套支持 | 类型保留 | 说明 |
+|------|----------|----------|------|
+| JSON | ✅ 完整 | ✅ 完整 | 推荐格式 |
+| TOML | ✅ 完整 | ✅ 完整 | 推荐格式 |
+| YAML | ✅ 完整 | ✅ 完整 | 推荐格式 |
+| INI | ✅ 点路径 | ❌ 全字符串 | 嵌套结构自动展平为点路径 |
+| XML | ✅ 完整 | ❌ 全字符串 | 值读回后为字符串 |
+
+**INI 格式特殊行为：**
+```python
+# 保存嵌套数据
+cfg = Config({'database': {'host': 'localhost', 'port': 3306}}, file='app.ini', way='ini')
+
+# INI 文件内容（点路径格式）：
+# [database]
+# host = localhost
+# port = 3306
+
+# 其他程序读取时需注意：
+# - 键名是 'database.host'，不是单独的 'host'
+# - 所有值都是字符串，需要手动转换类型
+```
+
+### 2.5 常见构造方式
 
 ```python
 # 空配置（默认文件 config.toml）
@@ -99,6 +131,20 @@ cfg = Config('secure.toml', pwd='my-secret-key')
 
 # 去抖保存（100ms内只保存一次）
 cfg = Config('app.toml', debounce_ms=100)
+
+# 多环境切换
+cfg = Config('app.toml', env='production')
+# 自动加载 app.production.toml
+
+# 环境变量覆盖
+cfg = Config('app.toml', env_prefix='MYAPP_')
+# 自动导入 MYAPP_* 环境变量
+
+# 类型验证
+schema = {'port': int, 'debug': bool, 'name': str}
+cfg = Config('app.toml', schema=schema)
+cfg.port = 8080      # ✅ 正常
+cfg.port = "8080"    # ❌ ConfigValidationError
 ```
 
 ---
@@ -402,6 +448,54 @@ cfg.from_env(prefix='APP')
 
 ---
 
+## 8.5 多环境切换
+
+```python
+# 构造函数参数
+Config(file='app.toml', env='production', env_prefix='MYAPP_')
+
+# 加载顺序（优先级从低到高）：
+# 1. app.toml（基础配置）
+# 2. app.production.toml（环境配置）
+# 3. MYAPP_* 环境变量（最高优先级）
+
+# 示例
+cfg = Config('app.toml', env='production', env_prefix='MYAPP_')
+# 1. 加载 app.toml
+# 2. 加载 app.production.toml（如果存在）
+# 3. 导入 MYAPP_* 环境变量
+```
+
+---
+
+## 8.6 类型验证
+
+```python
+# 定义 schema
+schema = {
+    'port': int,
+    'debug': bool,
+    'name': str,
+    'database.port': int,  # 支持点路径
+    'database.host': str
+}
+
+# 创建配置（带类型验证）
+cfg = Config('app.toml', schema=schema)
+
+# 正常设置
+cfg.port = 8080           # ✅
+cfg.set('port', 3306)     # ✅
+cfg['port'] = 5432        # ✅
+
+# 类型错误会抛出 ConfigValidationError
+cfg.port = "8080"         # ❌ 期望 int，得到 str
+cfg.debug = "true"        # ❌ 期望 bool，得到 str
+cfg.name = 123            # ❌ 期望 str，得到 int
+```
+
+---
+
 ## 9. 比较操作
 
 ### 9.1 diff - 比较差异
@@ -501,11 +595,11 @@ with Config('app.toml', auto_save=False) as cfg:
 ### 12.1 path / path_abs
 
 ```python
-path() -> str       # 返回相对路径
-path_abs() -> str   # 返回绝对路径
+path() -> str       # 返回绝对路径
+path_abs() -> str   # 返回绝对路径（与 path() 相同）
 
 cfg = Config('app.toml')
-cfg.path()          # 'app.toml'
+cfg.path()          # '/absolute/path/to/app.toml'
 cfg.path_abs()      # '/absolute/path/to/app.toml'
 ```
 
@@ -524,23 +618,40 @@ cfg.is_auto_save()          # False
 
 ## 13. 错误处理
 
-### 13.1 常见异常
+### 13.1 异常层次结构
+
+```python
+ConfigError (基类)
+├── ConfigIOError (文件 I/O 错误)
+├── ConfigValidationError (配置验证错误)
+└── ConfigEncryptionError (加密/解密错误)
+```
+
+### 13.2 常见异常
 
 | 异常类型 | 原因 | 解决方案 |
 |----------|------|----------|
-| `KeyError` | 路径不存在 | 检查键名，或使用 `get` 提供默认值 |
-| `KeyError` | overwrite_mode=False 时类型冲突 | 设置 `overwrite_mode=True` |
-| `ValueError` | 加密文件密码错误 | 使用正确密码 |
-| `ValueError` | 加密文件被篡改 | 使用正确密码重新加载 |
-| `AttributeError` | 键名与保留关键字冲突 | 使用 `opt` 属性访问 |
+| `ConfigValidationError` | 路径不存在 | 检查键名，或使用 `get` 提供默认值 |
+| `ConfigValidationError` | overwrite_mode=False 时类型冲突 | 设置 `overwrite_mode=True` |
+| `ConfigValidationError` | 类型验证失败 | 检查 schema 定义和赋值类型 |
+| `ConfigValidationError` | 键名与保留关键字冲突 | 使用 `opt` 属性访问 |
+| `ConfigEncryptionError` | 加密文件密码错误 | 使用正确密码 |
+| `ConfigEncryptionError` | 加密文件被篡改 | 使用正确密码重新加载 |
+| `ConfigIOError` | 文件读写失败 | 检查文件权限和路径 |
 
-### 13.2 错误信息增强
+### 13.3 错误信息增强
 
 ```python
-# KeyError 时会提示解决方案
+# 路径不存在时会提示解决方案
 cfg = Config({'a': 1})
 cfg['b']
-# KeyError: "路径 'b' 不存在。提示：可使用 get('b', default) 提供默认值，或使用 set('b', value) 创建该配置项。"
+# ConfigValidationError: "路径 'b' 不存在。提示：可使用 get('b', default) 提供默认值，或使用 set('b', value) 创建该配置项。"
+
+# 类型验证失败
+schema = {'port': int}
+cfg = Config(file='app.toml', schema=schema)
+cfg.port = "8080"
+# ConfigValidationError: "键 'port' 期望类型 int，实际得到 str"
 ```
 
 ---
@@ -606,6 +717,34 @@ cfg = Config('app.toml')
 cfg.from_env(prefix='APP')
 ```
 
+### 15.5 多环境切换
+
+```python
+# 开发环境
+cfg = Config('app.toml', env='dev')
+# 自动加载 app.dev.toml
+
+# 生产环境 + 环境变量覆盖
+cfg = Config('app.toml', env='production', env_prefix='MYAPP_')
+# 1. 加载 app.toml
+# 2. 加载 app.production.toml
+# 3. 导入 MYAPP_* 环境变量
+```
+
+### 15.6 类型验证
+
+```python
+# 定义 schema
+schema = {'port': int, 'debug': bool, 'name': str}
+
+# 创建配置
+cfg = Config('app.toml', schema=schema)
+
+# 类型错误会抛出 ConfigValidationError
+cfg.port = "8080"  # ❌
+cfg.port = 8080    # ✅
+```
+
 ### 15.5 安全访问冲突键
 
 ```python
@@ -625,7 +764,7 @@ cfg.opt.save  # 访问 'save' 配置项
 
 | 方法 | 说明 |
 |------|------|
-| `Config(data, file, way, ...)` | 创建配置管理器 |
+| `Config(data, file, way, ..., env, env_prefix, schema)` | 创建配置管理器 |
 
 ### 读写
 
@@ -671,6 +810,14 @@ cfg.opt.save  # 访问 'save' 配置项
 | `to_env(prefix, uppercase)` | 导出为环境变量 |
 | `from_env(prefix, separator)` | 从环境变量导入 |
 
+### 多环境与类型验证
+
+| 参数 | 说明 |
+|------|------|
+| `env` | 环境名称，自动加载 app.{env}.toml |
+| `env_prefix` | 环境变量前缀，自动导入 {prefix}* 环境变量 |
+| `schema` | 类型验证 schema，格式如 {'port': int} |
+
 ### 比较
 
 | 方法 | 说明 |
@@ -698,3 +845,9 @@ cfg.opt.save  # 访问 'save' 配置项
 6. **点路径**：支持 `a.b.c` 格式的嵌套访问
 7. **链式操作**：`set` 方法返回 `self`，支持链式调用
 8. **深拷贝**：`to_dict()` 返回深拷贝，修改不影响原配置
+9. **多环境切换**：`env` 参数自动加载 `app.{env}.toml`，`env_prefix` 自动导入环境变量
+10. **类型验证**：`schema` 参数支持类型检查，类型错误时抛出 `ConfigValidationError`
+11. **path() 返回绝对路径**：`path()` 和 `path_abs()` 都返回绝对路径
+12. **异常类型**：使用自定义异常（`ConfigError`, `ConfigIOError`, `ConfigValidationError`, `ConfigEncryptionError`）
+13. **INI 格式限制**：嵌套结构自动展平为点路径，所有值读回后为字符串
+14. **XML 格式限制**：所有值读回后为字符串

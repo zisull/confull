@@ -83,7 +83,8 @@ class Config:
 
     def __init__(self, data=None, file="config", way="", replace=False,
                  auto_save=True, pwd=None, process_safe: bool = False,
-                 debounce_ms: int = 0, env: str = None, env_prefix: str = ""):
+                 debounce_ms: int = 0, env: str = None, env_prefix: str = "",
+                 schema: Dict[str, type] = None):
         """
         初始化配置管理器。
         :param data: 初始配置数据（dict）
@@ -96,6 +97,7 @@ class Config:
         :param debounce_ms: 自动保存延迟（毫秒） 0 则立即保存 (默认) 可用于防止频繁保存性能问题。
         :param env: 环境名称（如 'dev', 'test', 'production'），会自动加载 app.{env}.toml
         :param env_prefix: 环境变量前缀（如 'APP'），会导入 APP_* 环境变量覆盖配置
+        :param schema: 类型验证 schema，格式如 {'port': int, 'debug': bool}
         """
         self._file_path = Path(file)
         # 若未指定 way，根据文件扩展名推断
@@ -123,6 +125,7 @@ class Config:
         self._lock = RLock()
         self._handler = ConfigHandlerFactory.get_handler(self._way)
         self._observer: Optional[Any] = None
+        self._schema = schema or {}  # 类型验证 schema
 
         # 占位线程/事件（for watchdog 命名兼容测试）
         self._watch_dummy_stop: Optional[threading.Event] = None
@@ -325,8 +328,9 @@ class Config:
                     f"路径冲突：键 '{keys[-1]}' 类型不兼容；如需覆盖，请设置 overwrite_mode=True。"
                 )
 
-        # Before setting final key, check reserved
+        # Before setting final key, check reserved and type
         self._conf_check_reserved(keys[-1])
+        self._validate_type(key, value)
         setattr(node, keys[-1], value)
 
         self._auto_save_if_needed()
@@ -973,12 +977,34 @@ class Config:
         if key in self._CONF_RESERVED:
             raise ConfigValidationError(f"关键字 '{key}' 为保留接口名称，禁止覆盖。请使用其他名称。")
 
+    def _validate_type(self, key: str, value: Any):
+        """
+        验证配置值类型是否符合 schema。
+        :param key: 配置项路径（支持点号路径）
+        :param value: 配置值
+        """
+        if not self._schema:
+            return
+        
+        # 检查是否有匹配的 schema 规则
+        expected_type = self._schema.get(key)
+        if expected_type is None:
+            return
+        
+        # 检查类型
+        if not isinstance(value, expected_type):
+            raise ConfigValidationError(
+                f"键 '{key}' 期望类型 {expected_type.__name__}，实际得到 {type(value).__name__}"
+            )
+
     def __setattr__(self, key, value):
         if key.startswith('_'):
             super().__setattr__(key, value)
         else:
             # 检查保留关键字
             self._conf_check_reserved(key)
+            # 类型检查
+            self._validate_type(key, value)
             setattr(self._data, key, value)
 
     def __delattr__(self, key):
@@ -999,6 +1025,8 @@ class Config:
         """
         实现字典方式赋值
         """
+        # 类型检查
+        self._validate_type(key, value)
         keys = key.split('.')
         node = self._data
         for k in keys[:-1]:

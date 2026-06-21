@@ -384,7 +384,8 @@ Config(
     process_safe=False,  # 是否进程安全
     debounce_ms=0,       # 去抖延迟（毫秒）
     env=None,            # 环境名称（如 'dev', 'production'）
-    env_prefix=""        # 环境变量前缀（如 'APP'）
+    env_prefix="",       # 环境变量前缀（如 'APP'）
+    schema=None          # 类型验证 schema
 )
 ```
 
@@ -413,10 +414,11 @@ cfg = Config('app.toml', env='production')
 cfg = Config('app.toml', env_prefix='MYAPP_')
 # 自动导入 MYAPP_* 环境变量
 
-# 组合使用
-cfg = Config('app.toml', env='dev', env_prefix='MYAPP_')
-# 1. 加载 app.toml
-# 2. 加载 app.dev.toml（覆盖）
+# 类型验证
+schema = {'port': int, 'debug': bool, 'name': str}
+cfg = Config('app.toml', schema=schema)
+cfg.port = 8080      # ✅ 正常
+cfg.port = "8080"    # ❌ 报错：期望 int，得到 str
 # 3. 导入 MYAPP_* 环境变量（最高优先级）
 ```
 
@@ -1038,7 +1040,42 @@ cfg = Config('app.toml', env='production', env_prefix='MYAPP_')
 2. 环境配置文件（app.{env}.toml）
 3. 环境变量（{env_prefix}*）
 
-### 技巧 5：配置模板
+### 技巧 5：类型验证
+
+```python
+# 定义 schema
+schema = {
+    'port': int,
+    'debug': bool,
+    'name': str,
+    'database.port': int,  # 支持点路径
+    'database.host': str
+}
+
+# 创建配置（带类型验证）
+cfg = Config('app.toml', schema=schema)
+
+# 正常设置
+cfg.port = 8080           # ✅
+cfg.set('port', 3306)     # ✅
+cfg['port'] = 5432        # ✅
+
+# 类型错误会抛出 ConfigValidationError
+cfg.port = "8080"         # ❌ 期望 int，得到 str
+cfg.debug = "true"        # ❌ 期望 bool，得到 str
+cfg.name = 123            # ❌ 期望 str，得到 int
+
+# 点路径验证
+cfg.set('database.port', 'not_a_number')  # ❌ 期望 int，得到 str
+```
+
+**支持的验证方式：**
+- `cfg.key = value`（属性方式）
+- `cfg.set('key', value)`（方法方式）
+- `cfg['key'] = value`（字典方式）
+- `cfg.update({'key': value})`（批量更新）
+
+### 技巧 6：配置模板
 
 ```python
 # 创建模板
@@ -1059,7 +1096,7 @@ template = {
 cfg = Config(template, file='app.toml')
 ```
 
-### 技巧 6：环境变量覆盖
+### 技巧 7：环境变量覆盖
 
 ```python
 # 基础配置
@@ -1069,7 +1106,7 @@ cfg = Config('app.toml')
 cfg.from_env(prefix='APP')
 ```
 
-### 技巧 7：配置加密 + 去抖
+### 技巧 8：配置加密 + 去抖
 
 ```python
 # 安全配置，100ms 去抖
@@ -1080,14 +1117,14 @@ cfg = Config(
 )
 ```
 
-### 技巧 8：多进程共享配置
+### 技巧 9：多进程共享配置
 
 ```python
 # 进程安全模式
 cfg = Config('shared.toml', process_safe=True)
 ```
 
-### 技巧 9：配置版本管理
+### 技巧 10：配置版本管理
 
 ```python
 # 读取配置
@@ -1100,7 +1137,7 @@ cfg.to_file('config.backup.toml')
 cfg.version = '2.0.0'
 ```
 
-### 技巧 10：链式操作
+### 技巧 11：链式操作
 
 ```python
 cfg = Config('app.toml')
@@ -1116,7 +1153,7 @@ cfg.merge({'cache': {'enabled': True}}) \
   .merge({'logging': {'level': 'INFO'}})
 ```
 
-### 技巧 11：配置校验
+### 技巧 12：配置校验
 
 ```python
 cfg = Config('app.toml')
@@ -1130,7 +1167,7 @@ cfg.setdefault('debug', False)
 cfg.setdefault('log_level', 'INFO')
 ```
 
-### 技巧 12：配置差异比较
+### 技巧 13：配置差异比较
 
 ```python
 # 比较两个版本的配置
@@ -1145,7 +1182,7 @@ if diff['modified']:
         print(f"  {key}: {change['old']} -> {change['new']}")
 ```
 
-### 技巧 13：导出为环境变量
+### 技巧 14：导出为环境变量
 
 ```python
 cfg = Config('app.toml')

@@ -922,5 +922,143 @@ class EnvSwitchTests(TempDirTestCase):
         self.assertEqual(cfg.app.name, 'prod')
 
 
+# ===========================================================
+# 16) 类型验证
+# ===========================================================
+
+
+class SchemaTests(TempDirTestCase):
+    """类型验证测试。"""
+
+    def test_schema_valid_type(self):
+        """测试有效类型。"""
+        schema = {'port': int, 'name': str, 'debug': bool}
+        fn = self._f('schema1.toml')
+        cfg = Config({'port': 8080}, file=fn, schema=schema)
+        
+        # 正常设置
+        cfg.set('port', 3306)
+        self.assertEqual(cfg.port, 3306)
+        
+        cfg.set('name', 'test')
+        self.assertEqual(cfg.name, 'test')
+        
+        cfg.set('debug', True)
+        self.assertEqual(cfg.debug, True)
+
+    def test_schema_invalid_type(self):
+        """测试无效类型。"""
+        schema = {'port': int, 'name': str, 'debug': bool}
+        fn = self._f('schema2.toml')
+        cfg = Config({'port': 8080}, file=fn, schema=schema)
+        
+        # 类型错误
+        with self.assertRaises(ConfigValidationError):
+            cfg.set('port', 'not_a_number')
+        
+        with self.assertRaises(ConfigValidationError):
+            cfg.set('debug', 'true')
+        
+        with self.assertRaises(ConfigValidationError):
+            cfg.set('name', 123)
+
+    def test_schema_no_validation(self):
+        """测试无 schema 时不验证。"""
+        fn = self._f('schema3.toml')
+        cfg = Config({'port': 8080}, file=fn)
+        
+        # 无 schema，任何类型都接受
+        cfg.set('port', 'not_a_number')
+        self.assertEqual(cfg.port, 'not_a_number')
+
+    def test_schema_dot_path(self):
+        """测试点路径 schema。"""
+        schema = {'database.port': int, 'database.host': str}
+        fn = self._f('schema4.toml')
+        cfg = Config({'database': {'port': 3306}}, file=fn, schema=schema)
+        
+        # 正常设置
+        cfg.set('database.port', 5432)
+        self.assertEqual(cfg.database.port, 5432)
+        
+        # 类型错误
+        with self.assertRaises(ConfigValidationError):
+            cfg.set('database.port', 'not_a_number')
+
+    def test_schema_attribute_access(self):
+        """测试属性方式设置。"""
+        schema = {'port': int, 'name': str}
+        fn = self._f('schema5.toml')
+        cfg = Config({'port': 8080}, file=fn, schema=schema)
+        
+        # 属性方式设置（通过 __setattr__）
+        cfg.port = 3306
+        self.assertEqual(cfg.port, 3306)
+        
+        # 属性方式类型错误
+        with self.assertRaises(ConfigValidationError):
+            cfg.port = 'not_a_number'
+
+    def test_schema_dict_access(self):
+        """测试字典方式设置。"""
+        schema = {'port': int, 'name': str}
+        fn = self._f('schema6.toml')
+        cfg = Config({'port': 8080}, file=fn, schema=schema)
+        
+        # 字典方式设置
+        cfg['port'] = 3306
+        self.assertEqual(cfg['port'], 3306)
+        
+        # 字典方式类型错误
+        with self.assertRaises(ConfigValidationError):
+            cfg['port'] = 'not_a_number'
+
+    def test_schema_update(self):
+        """测试 update 方法的类型检查。"""
+        schema = {'port': int, 'name': str}
+        fn = self._f('schema7.toml')
+        cfg = Config({'port': 8080}, file=fn, schema=schema)
+        
+        # 正常 update
+        cfg.update({'port': 3306})
+        self.assertEqual(cfg.port, 3306)
+        
+        # 类型错误
+        with self.assertRaises(ConfigValidationError):
+            cfg.update({'port': 'not_a_number'})
+
+    def test_schema_no_schema_key(self):
+        """测试 schema 中没有的键不验证。"""
+        schema = {'port': int}
+        fn = self._f('schema8.toml')
+        cfg = Config({'port': 8080}, file=fn, schema=schema)
+        
+        # schema 中没有 'name'，不验证
+        cfg.set('name', 123)  # 不报错
+        self.assertEqual(cfg.name, 123)
+
+    def test_schema_multiple_types(self):
+        """测试多种类型。"""
+        schema = {
+            'port': int,
+            'host': str,
+            'debug': bool,
+            'rate': float
+        }
+        fn = self._f('schema9.toml')
+        cfg = Config(file=fn, schema=schema)
+        
+        # 各种类型
+        cfg.set('port', 8080)
+        cfg.set('host', 'localhost')
+        cfg.set('debug', True)
+        cfg.set('rate', 3.14)
+        
+        self.assertEqual(cfg.port, 8080)
+        self.assertEqual(cfg.host, 'localhost')
+        self.assertEqual(cfg.debug, True)
+        self.assertEqual(cfg.rate, 3.14)
+
+
 if __name__ == "__main__":
     unittest.main()
