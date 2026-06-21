@@ -83,7 +83,7 @@ class Config:
 
     def __init__(self, data=None, file="config", way="", replace=False,
                  auto_save=True, pwd=None, process_safe: bool = False,
-                 debounce_ms: int = 0):
+                 debounce_ms: int = 0, env: str = None, env_prefix: str = ""):
         """
         初始化配置管理器。
         :param data: 初始配置数据（dict）
@@ -94,6 +94,8 @@ class Config:
         :param pwd: 密码字符串，用于加密配置文件
         :param process_safe: 是否进程安全（进程锁）
         :param debounce_ms: 自动保存延迟（毫秒） 0 则立即保存 (默认) 可用于防止频繁保存性能问题。
+        :param env: 环境名称（如 'dev', 'test', 'production'），会自动加载 app.{env}.toml
+        :param env_prefix: 环境变量前缀（如 'APP'），会导入 APP_* 环境变量覆盖配置
         """
         self._file_path = Path(file)
         # 若未指定 way，根据文件扩展名推断
@@ -134,6 +136,14 @@ class Config:
                 self._data = ConfigNode(data, manager=self)
                 self._dirty = True  # 强制标记需要保存
             self.save()  # 确保立即保存初始数据
+
+        # 加载环境特定配置（如 app.dev.toml, app.production.toml）
+        if env:
+            self._load_env_config(env)
+
+        # 从环境变量覆盖配置
+        if env_prefix:
+            self.from_env(prefix=env_prefix)
 
         # 程序退出时确保最后一次写盘
         atexit.register(self._flush_save)
@@ -629,6 +639,46 @@ class Config:
                 # 初始化为空数据，以避免后续操作出错。
                 self._data = ConfigNode({}, manager=self)
             # 其他所有异常（如解密失败、解析错误）都将正常抛出，不再被静默处理。
+
+    def _load_env_config(self, env: str):
+        """
+        加载环境特定配置文件（如 app.dev.toml）。
+        :param env: 环境名称
+        """
+        # 构建环境配置文件路径：app.toml -> app.dev.toml
+        env_file = self._file_path.with_stem(f"{self._file_path.stem}.{env}")
+        
+        if not env_file.exists():
+            logger.debug(f"环境配置文件不存在: {env_file}")
+            return
+        
+        try:
+            # 读取环境配置文件
+            with self._lock, self._process_lock(shared=True):
+                with env_file.open('rb') as f:
+                    raw_data = f.read()
+                
+                if not raw_data:
+                    return
+                
+                # 判断是否加密
+                if raw_data.startswith(ENCRYPT_HEADER):
+                    if not self._pwd:
+                        raise ConfigEncryptionError(f"环境配置文件 {env_file} 为加密文件，请提供密码")
+                    env_data = self._decrypt_data(raw_data)
+                else:
+                    read_mode = 'r' + self._handler.mode
+                    encoding = 'utf-8' if 'b' not in read_mode else None
+                    with env_file.open(read_mode, encoding=encoding) as f2:
+                        env_data = self._handler.load(f2)
+                
+                # 使用 update 方法合并配置（支持深度合并）
+                self.update(env_data)
+                logger.info(f"已加载环境配置: {env_file}")
+                
+        except Exception as e:
+            logger.error(f"加载环境配置文件失败 {env_file}: {e}")
+            raise ConfigIOError(f"加载环境配置文件失败 {env_file}: {e}") from e
 
     def reload(self):
         """

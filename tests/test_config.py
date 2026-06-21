@@ -818,5 +818,109 @@ class ConfigNodeTests(TempDirTestCase):
             node.has_top_level_key = 'bad'
 
 
+# ===========================================================
+# 15) 多环境切换
+# ===========================================================
+
+
+class EnvSwitchTests(TempDirTestCase):
+    """多环境切换测试。"""
+
+    def test_env_config_loading(self):
+        """测试环境配置文件加载。"""
+        # 创建基础配置
+        base_file = self._f('app.toml')
+        Config({'app': {'name': 'base', 'debug': False}}, file=base_file)
+        
+        # 创建环境配置
+        env_file = self._f('app.production.toml')
+        Config({'app': {'name': 'production', 'debug': False}}, file=env_file)
+        
+        # 使用 env 参数加载
+        cfg = Config(file=base_file, env='production')
+        self.assertEqual(cfg.app.name, 'production')
+        self.assertEqual(cfg.app.debug, False)
+
+    def test_env_config_override(self):
+        """测试环境配置覆盖基础配置。"""
+        # 创建基础配置
+        base_file = self._f('app2.toml')
+        Config({'db_host': 'localhost', 'db_port': 3306}, file=base_file)
+        
+        # 创建环境配置（只覆盖部分）
+        env_file = self._f('app2.dev.toml')
+        Config({'db_host': '127.0.0.1'}, file=env_file)
+        
+        # 使用 env 参数加载
+        cfg = Config(file=base_file, env='dev')
+        self.assertEqual(cfg.db_host, '127.0.0.1')  # 被覆盖
+        self.assertEqual(cfg.db_port, 3306)  # 保留基础值
+
+    def test_env_config_not_found(self):
+        """测试环境配置文件不存在时的行为。"""
+        base_file = self._f('app3.toml')
+        Config({'app': {'name': 'base'}}, file=base_file)
+        
+        # 不存在的环境配置文件
+        cfg = Config(file=base_file, env='nonexistent')
+        self.assertEqual(cfg.app.name, 'base')  # 保持基础配置
+
+    def test_env_prefix(self):
+        """测试环境变量前缀导入。"""
+        import os
+        base_file = self._f('app4.toml')
+        Config({'app_name': 'base'}, file=base_file)
+        
+        # 设置环境变量
+        os.environ['TEST_APP_NAME'] = 'from_env'
+        os.environ['TEST_APP_DEBUG'] = 'true'
+        
+        try:
+            cfg = Config(file=base_file, env_prefix='TEST_')
+            self.assertEqual(cfg.app_name, 'from_env')
+            self.assertEqual(cfg.app_debug, 'true')
+        finally:
+            # 清理环境变量
+            del os.environ['TEST_APP_NAME']
+            del os.environ['TEST_APP_DEBUG']
+
+    def test_env_and_prefix_combined(self):
+        """测试环境配置和环境变量组合使用。"""
+        import os
+        # 创建基础配置
+        base_file = self._f('app5.toml')
+        Config({'app_name': 'base', 'app_env': 'base'}, file=base_file)
+        
+        # 创建环境配置
+        env_file = self._f('app5.staging.toml')
+        Config({'app_name': 'staging'}, file=env_file)
+        
+        # 设置环境变量
+        os.environ['MYAPP_APP_NAME'] = 'override'
+        
+        try:
+            # 同时使用 env 和 env_prefix
+            cfg = Config(file=base_file, env='staging', env_prefix='MYAPP_')
+            self.assertEqual(cfg.app_name, 'override')  # 环境变量优先级最高
+            self.assertEqual(cfg.app_env, 'base')  # 保留基础值
+        finally:
+            del os.environ['MYAPP_APP_NAME']
+
+    def test_env_config_encrypted(self):
+        """测试加密环境配置文件加载。"""
+        pwd = 'test-password'
+        # 创建加密的基础配置
+        base_file = self._f('secure.toml')
+        Config({'app': {'name': 'base'}}, file=base_file, pwd=pwd)
+        
+        # 创建加密的环境配置
+        env_file = self._f('secure.prod.toml')
+        Config({'app': {'name': 'prod'}}, file=env_file, pwd=pwd)
+        
+        # 加载环境配置
+        cfg = Config(file=base_file, env='prod', pwd=pwd)
+        self.assertEqual(cfg.app.name, 'prod')
+
+
 if __name__ == "__main__":
     unittest.main()

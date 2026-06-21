@@ -48,7 +48,7 @@ pip install .
 | orjson | >=3.10 | JSON 高性能序列化 |
 | toml | >=0.10 | TOML 格式支持 |
 | PyYAML | >=6.0 | YAML 格式支持 |
-| watchdog | >=3.0 | 文件监听（可选） |
+| watchdog | >=6.0 | 文件监听（可选） |
 | portalocker | >=3.0 | 进程锁（可选） |
 | cryptography | >=42.0 | 加密功能（可选） |
 
@@ -382,7 +382,9 @@ Config(
     auto_save=True,      # 是否自动保存
     pwd=None,            # 加密密码
     process_safe=False,  # 是否进程安全
-    debounce_ms=0        # 去抖延迟（毫秒）
+    debounce_ms=0,       # 去抖延迟（毫秒）
+    env=None,            # 环境名称（如 'dev', 'production'）
+    env_prefix=""        # 环境变量前缀（如 'APP'）
 )
 ```
 
@@ -402,12 +404,27 @@ cfg = Config('secure.toml', pwd='secret')
 
 # 进程安全 + 去抖
 cfg = Config('shared.toml', process_safe=True, debounce_ms=100)
+
+# 多环境切换
+cfg = Config('app.toml', env='production')
+# 自动加载 app.production.toml
+
+# 环境变量覆盖
+cfg = Config('app.toml', env_prefix='MYAPP_')
+# 自动导入 MYAPP_* 环境变量
+
+# 组合使用
+cfg = Config('app.toml', env='dev', env_prefix='MYAPP_')
+# 1. 加载 app.toml
+# 2. 加载 app.dev.toml（覆盖）
+# 3. 导入 MYAPP_* 环境变量（最高优先级）
 ```
 
 **预期效果：**
 - 自动创建目录和文件
 - 自动推断格式（根据扩展名）
 - 程序退出时自动保存
+- 支持多环境配置切换
 
 ---
 
@@ -986,7 +1003,42 @@ user_cfg = Config('user.toml')
 default_cfg.merge(user_cfg, strategy='deep')
 ```
 
-### 技巧 4：配置模板
+### 技巧 4：多环境配置切换
+
+```python
+# 基础配置 app.toml
+# [app]
+# name = "MyApp"
+# debug = false
+# [database]
+# host = "localhost"
+# port = 3306
+
+# 环境配置 app.production.toml
+# [database]
+# host = "prod-db.example.com"
+
+# 开发环境
+cfg = Config('app.toml', env='dev')
+# 自动加载 app.dev.toml（如果存在）
+
+# 生产环境
+cfg = Config('app.toml', env='production')
+# 自动加载 app.production.toml
+
+# 环境变量覆盖（最高优先级）
+cfg = Config('app.toml', env='production', env_prefix='MYAPP_')
+# 1. 加载 app.toml
+# 2. 加载 app.production.toml
+# 3. 导入 MYAPP_* 环境变量
+```
+
+**配置优先级（从低到高）：**
+1. 基础配置文件（app.toml）
+2. 环境配置文件（app.{env}.toml）
+3. 环境变量（{env_prefix}*）
+
+### 技巧 5：配置模板
 
 ```python
 # 创建模板
@@ -1007,7 +1059,7 @@ template = {
 cfg = Config(template, file='app.toml')
 ```
 
-### 技巧 5：环境变量覆盖
+### 技巧 6：环境变量覆盖
 
 ```python
 # 基础配置
@@ -1017,7 +1069,7 @@ cfg = Config('app.toml')
 cfg.from_env(prefix='APP')
 ```
 
-### 技巧 6：配置加密 + 去抖
+### 技巧 7：配置加密 + 去抖
 
 ```python
 # 安全配置，100ms 去抖
@@ -1028,14 +1080,14 @@ cfg = Config(
 )
 ```
 
-### 技巧 7：多进程共享配置
+### 技巧 8：多进程共享配置
 
 ```python
 # 进程安全模式
 cfg = Config('shared.toml', process_safe=True)
 ```
 
-### 技巧 8：配置版本管理
+### 技巧 9：配置版本管理
 
 ```python
 # 读取配置
@@ -1048,7 +1100,7 @@ cfg.to_file('config.backup.toml')
 cfg.version = '2.0.0'
 ```
 
-### 技巧 9：链式操作
+### 技巧 10：链式操作
 
 ```python
 cfg = Config('app.toml')
@@ -1064,7 +1116,7 @@ cfg.merge({'cache': {'enabled': True}}) \
   .merge({'logging': {'level': 'INFO'}})
 ```
 
-### 技巧 10：配置校验
+### 技巧 11：配置校验
 
 ```python
 cfg = Config('app.toml')
@@ -1078,7 +1130,7 @@ cfg.setdefault('debug', False)
 cfg.setdefault('log_level', 'INFO')
 ```
 
-### 技巧 11：配置差异比较
+### 技巧 12：配置差异比较
 
 ```python
 # 比较两个版本的配置
@@ -1093,7 +1145,7 @@ if diff['modified']:
         print(f"  {key}: {change['old']} -> {change['new']}")
 ```
 
-### 技巧 12：导出为环境变量
+### 技巧 13：导出为环境变量
 
 ```python
 cfg = Config('app.toml')

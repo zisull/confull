@@ -19,7 +19,7 @@ python = "^3.8"
 orjson = "^3.10.11"
 toml = "^0.10.2"
 PyYAML = "^6.0.2"
-watchdog = "^3.0.0"
+watchdog = "^6.0.0"
 portalocker = "^3.0.0"
 cryptography = "^42.0.0"
 
