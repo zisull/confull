@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "confull"
-version = "0.1.1"
+version = "0.2.0"
 description = "一个简单的配置管理工具(A simple dictionary configuration management tool),dict <-> config file [json, toml, yaml, ini, xml]"
 authors = ["zisul <zisull@qq.com>"]
 readme = "README.md"
@@ -17,11 +17,21 @@ classifiers = [
 [tool.poetry.dependencies]
 python = "^3.9"
 orjson = "^3.10.11"
-toml = "^0.10.2"
-PyYAML = "^6.0.2"
-watchdog = "^6.0.0"
-portalocker = "^3.0.0"
-cryptography = "^42.0.0"
+toml = "^0.10.2"          # 默认格式，必装
+PyYAML = { version = "^6.0.2", optional = true }
+watchdog = { version = "^6.0.0", optional = true }
+portalocker = { version = "^3.0.0", optional = true }
+cryptography = { version = "^42.0.0", optional = true }
+
+[tool.poetry.extras]
+yaml = ["PyYAML"]
+watch = ["watchdog"]
+process = ["portalocker"]
+encrypt = ["cryptography"]
+all = ["PyYAML", "watchdog", "portalocker", "cryptography"]
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.0"
 
 [tool.mypy]
 python_version = "3.8"

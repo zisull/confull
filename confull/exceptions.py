@@ -4,23 +4,39 @@
 方便外部根据具体错误类型捕获。
 """
 
-import logging
-
-logger = logging.getLogger(__name__)
 
 class ConfigError(Exception):
-    """配置库基类异常，会自动写入日志。"""
+    """配置库基类异常。
 
-    def __init__(self, message: str):
+    构造时不写日志：是否记录由调用方决定，库本身不应在抛出路径上产生副作用。
+    """
+
+    def __init__(self, message: str = ""):
         super().__init__(message)
-        # 立即记录错误日志，便于统一追踪
-        logger.error(message)
+        self.message = message
+
+    def __str__(self) -> str:
+        return self.message
+
 
 class ConfigIOError(ConfigError):
     """文件 I/O 相关错误"""
 
+
 class ConfigValidationError(ConfigError):
     """解析或数据校验错误"""
 
+
 class ConfigEncryptionError(ConfigError):
     """加密 / 解密相关错误"""
+
+
+class ConfigKeyError(ConfigValidationError, KeyError):
+    """配置键或路径不存在。
+
+    同时是 ``KeyError``，以便 ``in``、``get`` 等 Mapping 协议保持标准语义。
+    """
+
+    def __init__(self, key, message: str = ""):
+        super().__init__(message or f"键 '{key}' 不存在。")
+        self.key = key

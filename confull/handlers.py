@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import orjson
-import toml
-import yaml
 import configparser
+import importlib
 import xml.etree.ElementTree as ElementTree
 from typing import Any, Dict, IO, Type
+
+import orjson
 
 from .formats import Format
 
@@ -32,6 +32,16 @@ class ConfigHandler:
         raise NotImplementedError
 
 
+def _require(module_name: str):
+    """按需导入可选格式依赖，缺失时给出可操作的提示。"""
+    try:
+        return importlib.import_module(module_name)
+    except ImportError as exc:
+        raise ImportError(
+            f"读写该格式需要 '{module_name}'，请先安装：pip install 'confull[{module_name}]'"
+        ) from exc
+
+
 class JSONConfigHandler(ConfigHandler):
     """JSON 格式处理器"""
 
@@ -48,20 +58,20 @@ class TOMLConfigHandler(ConfigHandler):
     """TOML 格式处理器"""
 
     def load(self, file: IO) -> Dict[str, Any]:
-        return toml.load(file)
+        return _require("toml").load(file)
 
     def save(self, data: Dict[str, Any], file: IO):
-        file.write(toml.dumps(data))  # type: ignore[arg-type]
+        file.write(_require("toml").dumps(data))  # type: ignore[arg-type]
 
 
 class YAMLConfigHandler(ConfigHandler):
     """YAML 格式处理器"""
 
     def load(self, file: IO) -> Dict[str, Any]:
-        return yaml.safe_load(file) or {}
+        return _require("yaml").safe_load(file) or {}
 
     def save(self, data: Dict[str, Any], file: IO):
-        yaml.safe_dump(data, file, allow_unicode=True, sort_keys=False)
+        _require("yaml").safe_dump(data, file, allow_unicode=True, sort_keys=False)
 
 
 class INIConfigHandler(ConfigHandler):
@@ -72,12 +82,12 @@ class INIConfigHandler(ConfigHandler):
         parser.read_file(file)
         
         result = {}
-        # 直接访问 _sections 来获取每个 section 自己的键值对（不包括 DEFAULT）
+        defaults = parser.defaults()
         for section in parser.sections():
             section_data = {}
-            # 使用 parser._sections[section] 获取原始键值对
-            if section in parser._sections:
-                for key, value in parser._sections[section].items():
+            # items() 会带上 DEFAULT 段的键，那些值在顶层单独存放，这里跳过。
+            for key, value in parser.items(section):
+                if key not in defaults:
                     self._set_nested(section_data, key, value)
             result[section] = section_data
         

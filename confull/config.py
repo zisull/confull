@@ -2,248 +2,228 @@
 # @author: zisull@qq.com
 # @date: 2024年11月19日
 
-import base64 as _b64  # for Fernet key encoding
+import atexit
+import base64 as _b64
 import logging
 import os
 import sys
 import threading
-import atexit
-from functools import lru_cache
+import weakref
 from contextlib import contextmanager
 from pathlib import Path
 from threading import RLock
-from typing import Dict, Optional, Any, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 import orjson
-import portalocker  # process-level file locking
-from cryptography.fernet import Fernet, InvalidToken
-from cryptography.hazmat.primitives.hashes import SHA256
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-from watchdog.events import FileSystemEventHandler
-from watchdog.observers import Observer
 
+from .exceptions import (
+    ConfigEncryptionError,
+    ConfigError,
+    ConfigIOError,
+    ConfigKeyError,
+    ConfigValidationError,
+)
 from .formats import Format
 from .handlers import ConfigHandlerFactory
-# Local imports
 from .node import ConfigNode
-from .exceptions import ConfigError, ConfigIOError, ConfigValidationError, ConfigEncryptionError
 
-ENCRYPT_HEADER = b'ZISULLCONFULLENC'  # encryption header updated
-SALT_SIZE = 8  # 每次保存使用 8 字节随机 salt
+ENCRYPT_HEADER = b"ZISULLCONFULLENC"
+SALT_SIZE = 8  # 保持与 0.1.x 文件格式兼容，改动会让既有加密文件无法解析
+PBKDF2_ITERATIONS = 100_000
 
 # logger
 logger = logging.getLogger(__name__)
 
-
-class _DataProxy:
-    """
-    纯净的数据代理，没有任何公共方法（除了部分魔术方法），只有数据访问。
-    用于解决配置项名称与 Config 类方法名冲突的问题。
-    """
-    def __init__(self, node):
-        # 使用 object.__setattr__ 避免触发自己的 __setattr__
-        object.__setattr__(self, "_node", node)
-
-    def __getattr__(self, key):
-        return self._node[key]
-
-    def __setattr__(self, key, value):
-        self._node[key] = value
-
-    def __getitem__(self, key):
-        return self._node[key]
-
-    def __setitem__(self, key, value):
-        self._node[key] = value
-
-    def __delitem__(self, key):
-        del self._node[key]
-
-    def __delattr__(self, key):
-        del self._node[key]
-
-    def __iter__(self):
-        return iter(self._node)
-
-    def __len__(self):
-        return len(self._node)
-
-    def __contains__(self, key):
-        return key in self._node
-
-    def __repr__(self):
-        return repr(self._node)
+# 需要退出时冲刷的实例。Config 是 Mapping（不可哈希），所以持有弱引用而不是 WeakSet。
+_LIVE: list = []
+_atexit_registered = False
 
 
-class Config:
-    """
-    多格式配置管理器，支持 dict <=> [ini, xml, json, toml, yaml] 的读写与自动保存。
+def _register_for_flush(cfg: "Config") -> None:
+    global _atexit_registered
+    if len(_LIVE) >= 32:
+        _LIVE[:] = [ref for ref in _LIVE if ref() is not None]
+    _LIVE.append(weakref.ref(cfg))
+    if not _atexit_registered:
+        atexit.register(_flush_all)
+        _atexit_registered = True
+
+
+def _flush_all() -> None:
+    for ref in _LIVE:
+        cfg = ref()
+        if cfg is None:
+            continue
+        try:
+            cfg._flush_save()
+        except Exception as exc:  # 退出阶段只报告，不抛出
+            logger.warning("退出时保存 %s 失败：%s", cfg._file_path, exc)
+
+
+class Config(ConfigNode):
+    """多格式配置管理器，支持 dict <=> [ini, xml, json, toml, yaml] 的读写与自动保存。
+
+    自身就是配置树的根节点（继承 ``ConfigNode``），因此顶层与嵌套层级的访问规则完全一致。
     支持密码加密保护。
     """
 
-    def __init__(self, data=None, file="config", way="", replace=False,
-                 auto_save=True, pwd=None, process_safe: bool = False,
-                 debounce_ms: int = 0, env: str = None, env_prefix: str = "",
-                 schema: Dict[str, type] = None):
-        """
-        初始化配置管理器。
-        :param data: 初始配置数据（dict）
-        :param file: 配置文件名（可无扩展名,可自动创建目录）
+    def __init__(
+        self,
+        file_or_data: Union[str, os.PathLike, Dict[str, Any], None] = None,
+        /,
+        file: Union[str, os.PathLike, None] = None,
+        way: str = "",
+        replace: bool = False,
+        auto_save: bool = True,
+        pwd: Optional[str] = None,
+        process_safe: bool = False,
+        debounce_ms: int = 0,
+        env: Optional[str] = None,
+        env_prefix: str = "",
+        schema: Optional[Dict[str, type]] = None,
+        *,
+        data: Optional[Dict[str, Any]] = None,
+    ):
+        """初始化配置管理器。
+
+        第一个参数可以是文件名也可以是初始 dict，几种写法等价：
+        ``Config('app.toml')``、``Config({'a': 1}, file='app.toml')``、
+        ``Config('app.toml', data={'a': 1})``。
+
+        :param file: 配置文件名（可无扩展名，可自动创建目录）
         :param way: 配置文件格式（json/toml/yaml/ini/xml）
         :param replace: 是否覆盖已有配置文件
         :param auto_save: 是否自动保存
         :param pwd: 密码字符串，用于加密配置文件
-        :param process_safe: 是否进程安全（进程锁）
-        :param debounce_ms: 自动保存延迟（毫秒） 0 则立即保存 (默认) 可用于防止频繁保存性能问题。
-        :param env: 环境名称（如 'dev', 'test', 'production'），会自动加载 app.{env}.toml
-        :param env_prefix: 环境变量前缀（如 'APP'），会导入 APP_* 环境变量覆盖配置
-        :param schema: 类型验证 schema，格式如 {'port': int, 'debug': bool}
+        :param process_safe: 是否进程安全（进程锁，需要 portalocker）
+        :param debounce_ms: 自动保存延迟（毫秒），0 表示立即保存
+        :param env: 环境名称，会自动合并 app.{env}.toml
+        :param env_prefix: 环境变量前缀，会导入 {prefix}_* 覆盖配置
+        :param schema: 类型校验，如 {'port': int, 'db.host': str}
+        :param data: 初始配置数据（dict）
         """
-        self._file_path = Path(file)
-        # 若未指定 way，根据文件扩展名推断
+        if isinstance(file_or_data, (str, os.PathLike, Path)):
+            if file is not None:
+                raise ConfigValidationError(
+                    "文件名传了两次：第一个参数按文件名处理时不能再传 file。"
+                    "请写成 Config('app.toml', data={...})。"
+                )
+            file = file_or_data
+        elif file_or_data is not None:
+            if data is not None:
+                raise ConfigValidationError("初始数据传了两次：第一个参数和 data 只能选一个。")
+            data = file_or_data
+
+        self._defer = 0
+        self._validating = True
+        self._file_path = Path(file) if file is not None else Path("config")
         if way == "":
-            ext = self._file_path.suffix.lstrip('.').lower()
+            ext = self._file_path.suffix.lstrip(".").lower()
             try:
                 way = Format.from_str(ext).value
             except ValueError:
                 way = "toml"
 
-        # Support str or Format for `way`
-        self._way = self.validate_format(way)
-        self._file_path = self.ensure_extension(self._file_path)  # # 调用 ensure_extension 来创建目录和添加扩展名
-        # 统一使用绝对路径，避免 cwd 变化导致文件写入到意外位置
-        self._file_path = self._file_path.resolve()
-        
+        self._way = self._validate_format(way)
+        self._file_path = self._ensure_extension(self._file_path).resolve()
+
         self._auto_save = auto_save
-        self._debounce_ms = max(0, debounce_ms)  # 去抖时长 (毫秒)
+        self._debounce_ms = max(0, debounce_ms)
         self._save_timer: Optional[threading.Timer] = None
-        # 即时保存，无延迟
-        self._pwd = pwd  # password string; encryption key derived per save
+        self._pwd = pwd
         self._process_safe = process_safe
-        self._data = ConfigNode(data if data is not None else {}, manager=self)
-        self._dirty = False if data is not None else True
         self._lock = RLock()
         self._handler = ConfigHandlerFactory.get_handler(self._way)
         self._observer: Optional[Any] = None
-        self._schema = schema or {}  # 类型验证 schema
+        self._schema: Dict[str, type] = dict(schema or {})
+        self._salt: Optional[bytes] = None
+        self._fernet: Optional[Any] = None
+        self._fernet_pwd: Optional[str] = None
+        self._dirty = False
+        self._last_saved_mtime: Optional[int] = None
 
-        # 占位线程/事件（for watchdog 命名兼容测试）
-        self._watch_dummy_stop: Optional[threading.Event] = None
-        self._watch_dummy_thread: Optional[threading.Thread] = None
+        super().__init__(None, manager=self)
+        _register_for_flush(self)
 
         if self._file_path.exists() and not replace:
             self._load()
         else:
-            # 当文件不存在时，无论replace参数如何都使用data初始化
             if data is not None:
-                self._data = ConfigNode(data, manager=self)
-                self._dirty = True  # 强制标记需要保存
-            self.save()  # 确保立即保存初始数据
+                if not isinstance(data, dict):
+                    raise ConfigValidationError(
+                        f"初始数据必须是 dict，实际得到 {type(data).__name__}。"
+                    )
+                self.set_data(data)
+            self._dirty = True
+            self.save()
 
-        # 加载环境特定配置（如 app.dev.toml, app.production.toml）
         if env:
             self._load_env_config(env)
-
-        # 从环境变量覆盖配置
         if env_prefix:
             self.from_env(prefix=env_prefix)
 
-        # 程序退出时确保最后一次写盘
-        atexit.register(self._flush_save)
-    
-    @property
-    def opt(self):
+        self._warn_shadowed()
+
+    # ------------------------------------------------------------------
+    # 写入校验（由 ConfigNode 回调）
+    # ------------------------------------------------------------------
+    def _validate_write(self, path: str, value: Any) -> None:
+        if not self._schema:
+            return
+        expected = self._schema.get(path)
+        if expected is None:
+            return
+        if expected is int and isinstance(value, bool):
+            raise ConfigValidationError(f"键 '{path}' 期望类型 int，实际得到 bool")
+        if not isinstance(value, expected):
+            name = getattr(expected, "__name__", str(expected))
+            raise ConfigValidationError(
+                f"键 '{path}' 期望类型 {name}，实际得到 {type(value).__name__}"
+            )
+
+    # ------------------------------------------------------------------
+    # 冲突可见性
+    # ------------------------------------------------------------------
+    def _warn_shadowed(self) -> None:
+        """与接口同名、属性访问拿不到的配置键：报告出来，而不是静默。
+
+        同一批键只报一次，避免批量写入时刷屏。
         """
-        返回一个纯净的数据访问接口，避免与 save/load 等方法冲突。
-        使用 config.opt.key 访问配置项。
-        """
-        return _DataProxy(self._data)
-
-    # _generate_key 方法已废弃，改为在 _encrypt_data 内部按次生成随机 salt
-
-    # ------------------------------------------------------------------
-    # Fernet 加密 / 解密
-    # ------------------------------------------------------------------
-
-    # ------------------------------------------------------------------
-    # KDF 缓存：减少重复派生开销
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    @lru_cache(maxsize=128)
-    def _cached_kdf(password: str, salt: bytes) -> bytes:
-        """缓存 (password, salt) → Fernet key 派生结果，降低 CPU 开销。"""
-        kdf = PBKDF2HMAC(
-            algorithm=SHA256(),
-            length=32,
-            salt=salt,
-            iterations=100_000,
-        )
-        return _b64.urlsafe_b64encode(kdf.derive(password.encode()))
-
-    def _derive_key(self, salt: bytes) -> bytes:
-        """从密码+salt 获取/派生 32 字节 Fernet key（带缓存）。"""
-        assert self._pwd is not None  # 类型检查安全保证
-        return self._cached_kdf(self._pwd, salt)
-
-    def _encrypt_data(self, data):
-        """使用 Fernet(AES128 + HMAC) 加密配置数据"""
-        if not self._pwd:
-            return data
-
-        # Fernet path
-        json_bytes = orjson.dumps(data)
-        salt = os.urandom(SALT_SIZE)
-        cipher = Fernet(self._derive_key(salt))
-        ciphertext = cipher.encrypt(json_bytes)
-        return ENCRYPT_HEADER + salt + ciphertext
-
-    def _decrypt_data(self, encrypted_data):
-        """解密 Fernet 加密数据，密码错误或数据被篡改时抛 ValueError"""
-        if not self._pwd:
-            raise ConfigEncryptionError("解密时需要提供密码。")
-
-        if not encrypted_data.startswith(ENCRYPT_HEADER):
-            # 非加密内容，直接返回
-            return encrypted_data
-
-        try:
-            blob = encrypted_data[len(ENCRYPT_HEADER):]
-            salt, ciphertext = blob[:SALT_SIZE], blob[SALT_SIZE:]
-            cipher = Fernet(self._derive_key(salt))
-            plain = cipher.decrypt(ciphertext)
-            return orjson.loads(plain)
-        except InvalidToken:
-            raise ConfigEncryptionError("校验失败：密码错误或数据损坏")
-        except Exception as e:
-            raise ConfigEncryptionError(f"解密失败: {e}") from e
+        reported = self.__dict__.setdefault("_shadow_reported", set())
+        for path, keys in self.find_shadowed().items():
+            for key in keys:
+                if (path, key) in reported:
+                    continue
+                reported.add((path, key))
+                label = "顶层" if path == "." else f"'{path}' 下"
+                logger.warning(
+                    "%s配置键 %r 与接口同名，属性访问会得到方法本身；"
+                    "请改用 ['%s'] 或 opt.%s 访问。",
+                    label,
+                    key,
+                    key,
+                    key,
+                )
 
     # ------------------------------------------------------------------
     # 公开方法：数据与元信息导出
     # ------------------------------------------------------------------
-    def to_json(self, indent: int = 2):
+    def to_json(self, indent: int = 2) -> str:
         """以 JSON 字符串形式返回配置数据。
 
-        参数
-        ----
-        indent : int, 默认 2
-            缩进空格数；`indent==2` 时使用 orjson 提供更快的序列化，
-            其它值则回退至标准库 ``json.dumps``。"""
+        ``indent == 2`` 时走 orjson 快速路径，其它值回退标准库 ``json``。
+        """
         if indent == 2:
-            return orjson.dumps(self._data.dict, option=orjson.OPT_INDENT_2).decode("utf-8")
+            return orjson.dumps(self._expand(), option=orjson.OPT_INDENT_2).decode("utf-8")
         import json
-        return json.dumps(self._data.dict, indent=indent, ensure_ascii=False)
 
-    def to_dict(self):
-        """以 `dict` 形式返回完整展开后的配置数据。"""
-        # ConfigNode.dict already returns a deep dict; just proxy it.
-        return self._data.dict
+        return json.dumps(self._expand(), indent=indent, ensure_ascii=False)
 
     def is_auto_save(self) -> bool:
         """返回当前是否开启自动保存。"""
         return self._auto_save
 
-    def set_auto_save(self, flag: bool):
+    def set_auto_save(self, flag: bool) -> None:
         """开启或关闭自动保存。"""
         self._auto_save = bool(flag)
 
@@ -255,498 +235,443 @@ class Config:
         """返回配置文件的绝对路径。"""
         return str(self._file_path.absolute())
 
-    # ------------------------------------------------------------------
-    # 魔法方法
-    # ------------------------------------------------------------------
-    def __str__(self):
-        """Human-readable string representation."""
-        return str(self._data.dict)
+    def __str__(self) -> str:
+        return str(self._expand())
 
-    def __repr__(self):
-        return repr(self._data.dict)
+    def __repr__(self) -> str:
+        return repr(self._expand())
 
+    # ------------------------------------------------------------------
+    # 读写
+    # ------------------------------------------------------------------
     def get(self, key: str, default: Any = None) -> Any:
-        """
-        读取配置项，支持点号路径。
-        :param key: 配置项路径（如 a.b.c）
-        :param default: 默认值
-        :return: 配置值或默认值
-        """
-        keys = key.split('.')
-        node = self._data
-        for k in keys:
-            if isinstance(node, ConfigNode):
-                node = node.data.get(k, None)
-                if isinstance(node, dict):
-                    node = ConfigNode(node, manager=self)
-                elif node is None:
-                    return default
-            else:
-                return default
-        return node
+        """读取配置项，支持点号路径；不存在时返回 ``default``。"""
+        try:
+            return self[key]
+        except (ConfigKeyError, KeyError):
+            return default
 
     def set(self, key: str, value: Any, overwrite_mode: bool = False) -> "Config":
-        """
-        写入配置项，支持点号路径。
-        :param key: 配置项路径
-        :param value: 配置值
-        :param overwrite_mode: 路径冲突时是否覆盖
+        """写入配置项，支持点号路径；语义与属性写入一致（接口同名的键会被拒绝）。
+
         :return: self，支持链式操作
         """
-        self.mark_dirty()
-        keys = key.split('.')
-        node = self._data
-
+        keys = key.split(".")
+        node: ConfigNode = self
         for k in keys[:-1]:
-            if isinstance(node, ConfigNode):
-                child = node.data.get(k)
-                # 如果 child 不存在，自动创建空 dict
-                if child is None:
+            child = node._data.get(k)
+            if child is None:
+                node[k] = {}
+            elif not isinstance(child, ConfigNode):
+                if overwrite_mode:
                     node[k] = {}
-                elif not isinstance(child, (dict, ConfigNode)):
-                    if overwrite_mode:
-                        node[k] = {}
-                    else:
-                        raise ConfigValidationError(
-                            f"路径 '{k}' 不是可写分区，或不存在；如需自动创建，请设置 overwrite_mode=True。"
-                        )
-            else:
-                # This should not be reached if self._data is always a ConfigNode
-                raise ConfigError(
-                    f"内部错误：预期 ConfigNode，实际得到 {type(node)}。"
-                )
+                else:
+                    raise ConfigValidationError(
+                        f"路径 '{k}' 已存在但不是节点；如需把它改成节点，请设置 overwrite_mode=True。"
+                    )
+            node = node._data[k]
 
-            node = getattr(node, k)
-
-        # 如果目标键已存在
-        if keys[-1] in node.data:
-            existing_val = node.data[keys[-1]]
-            # 若存在"叶子↔节点"结构冲突才需要 overwrite_mode
-            type_conflict = isinstance(existing_val, (dict, ConfigNode)) ^ isinstance(value, (dict, ConfigNode))
-            if type_conflict and not overwrite_mode:
+        final = keys[-1]
+        existing = node._data.get(final)
+        if existing is not None:
+            is_branch = isinstance(existing, ConfigNode)
+            is_leaf = isinstance(value, (dict, ConfigNode))
+            if is_branch != is_leaf and not overwrite_mode:
                 raise ConfigValidationError(
-                    f"路径冲突：键 '{keys[-1]}' 类型不兼容；如需覆盖，请设置 overwrite_mode=True。"
+                    f"路径冲突：键 '{final}' 类型不兼容；如需覆盖，请设置 overwrite_mode=True。"
                 )
-
-        # Before setting final key, check reserved and type
-        self._conf_check_reserved(keys[-1])
-        self._validate_type(key, value)
-        setattr(node, keys[-1], value)
-
-        self._auto_save_if_needed()
+        # 交给本层的属性写入语义：接口同名会报错并指路，类型校验由 _validate_write 负责。
+        setattr(node, final, value)
         return self
 
     def setdefault(self, key: str, value: Any) -> Any:
-        """
-        设置默认值，仅在键不存在时生效。
-        :param key: 配置项路径
-        :param value: 默认值
-        :return: 最终的配置值
-        """
+        """键不存在时写入默认值，返回最终值。"""
         if key not in self:
             self.set(key, value)
         return self.get(key)
 
-    def first(self, *keys, default=None):
-        """
-        获取第一个存在的键值。
-        :param keys: 多个候选键名
-        :param default: 所有键都不存在时的默认值
-        :return: 第一个存在的键值，或默认值
-        """
+    def first(self, *keys: str, default: Any = None) -> Any:
+        """返回第一个存在且不为 None 的值。"""
         for key in keys:
-            try:
-                value = self.get(key)
-                if value is not None:
-                    return value
-            except (KeyError, AttributeError):
-                continue
+            value = self.get(key)
+            if value is not None:
+                return value
         return default
 
-    def require(self, key):
-        """
-        获取必需的配置项，不存在时抛出明确错误。
-        :param key: 配置项路径
-        :return: 配置值
-        :raises KeyError: 配置项不存在
-        """
+    def require(self, key: str) -> Any:
+        """获取必需的配置项，不存在或为 None 时抛出 ``ConfigValidationError``。"""
         value = self.get(key)
         if value is None:
             raise ConfigValidationError(f"必需的配置项 '{key}' 不存在或值为 None")
         return value
 
-    def del_clean(self) -> bool:
-        """清空所有配置并删除配置文件。
-        :return: 是否成功删除
-        """
-        self.mark_dirty()
-        with self._lock:
-            if self._file_path.exists():
-                try:
-                    self._file_path.unlink()
-                    # 同时删除锁文件
-                    if self._process_safe:
-                        lock_path = self._lock_path()
-                        if lock_path.exists():
-                            lock_path.unlink()
-                    self._data = ConfigNode({}, manager=self)
-                    return True
-                except OSError as e:
-                    logger.warning("清除配置文件 %s 失败：%s", self._file_path, e)
-                    return False
-            else:
-                return False
+    def del_key(self, key: str) -> bool:
+        """删除配置项，支持点号路径，并自动清理空的父节点。
 
+        :return: 是否真的删除了东西
+        """
+        try:
+            del self[key]
+        except (ConfigKeyError, KeyError):
+            return False
+        self._prune_empty(key)
+        return True
+
+    def _prune_empty(self, key: str) -> None:
+        parts = key.split(".")[:-1]
+        while parts:
+            path = ".".join(parts)
+            node = self.get(path)
+            if not isinstance(node, ConfigNode) or node._data:
+                return
+            del self[path]
+            parts.pop()
+
+    # ------------------------------------------------------------------
+    # 批量操作：容器语义，永不因键名与接口同名而失败
+    # ------------------------------------------------------------------
     def update(self, data: Dict[str, Any]) -> None:
-        """
-        批量更新配置项。
-        :param data: dict，支持点号路径
-        """
-        for key, value in data.items():
-            # 使用 set 方法确保数据正确写入 ConfigNode
-            self.set(key, value, overwrite_mode=True)
+        """批量更新配置项，键支持点号路径；与外部数据源对接的推荐入口。"""
+        with self._deferred():
+            for key, value in data.items():
+                self[key] = value
+        self._warn_shadowed()
 
     def set_data(self, data: Dict[str, Any]) -> None:
-        """
-        用 dict 完全替换配置数据。
-        :param data: 新配置 dict
-        """
-        self.mark_dirty()
-        for top_key in data.keys():
-            self._conf_check_reserved(str(top_key))
-        self._data = ConfigNode(data, manager=self)
-        self._auto_save_if_needed()
+        """用 dict 完全替换配置数据。"""
+        with self._deferred():
+            self._replace(data)
+            self._dirty = True
+        self._warn_shadowed()
 
-    def merge(self, other: Union[Dict[str, Any], "Config"], strategy: str = "override") -> "Config":
-        """
-        合并配置。
-        :param other: 要合并的 dict 或 Config 对象
-        :param strategy: 合并策略
-            - 'override': 覆盖已有值（默认）
-            - 'keep': 保留已有值
-            - 'deep': 深度合并嵌套字典
-        :return: self，支持链式操作
+    def _replace(self, mapping: Optional[Dict[str, Any]]) -> None:
+        self._data = {}
+        for key, value in (mapping or {}).items():
+            self._write(key, value)
+
+    def merge(
+        self, other: Union[Dict[str, Any], "Config"], strategy: str = "override"
+    ) -> "Config":
+        """合并配置。
+
+        :param strategy: 'override' 覆盖已有值；'keep' 保留已有值；'deep' 深度合并嵌套字典
         """
         if isinstance(other, Config):
             other_data = other.to_dict()
         elif isinstance(other, dict):
             other_data = other
         else:
-            raise ConfigValidationError(f"不支持的类型: {type(other)}，期望 dict 或 Config")
+            raise ConfigValidationError(
+                f"不支持的类型: {type(other)}，期望 dict 或 Config"
+            )
+        if strategy not in ("override", "keep", "deep"):
+            raise ConfigValidationError(
+                f"未知的合并策略: {strategy}，支持 'override'、'keep'、'deep'"
+            )
 
-        # 使用 set 方法确保数据正确写入 ConfigNode
-        for key, value in other_data.items():
-            if strategy == "override":
-                self.set(key, value, overwrite_mode=True)
-            elif strategy == "keep":
-                if key not in self:
-                    self.set(key, value)
-            elif strategy == "deep":
-                if key in self:
-                    existing = self.get(key)
-                    if isinstance(existing, ConfigNode):
-                        existing = existing.dict
-                    if isinstance(existing, dict) and isinstance(value, dict):
-                        # 深度合并嵌套字典
-                        merged = self._deep_merge_dicts(existing, value)
-                        self.set(key, merged, overwrite_mode=True)
-                    else:
-                        self.set(key, value, overwrite_mode=True)
+        with self._deferred():
+            for key, value in other_data.items():
+                if strategy == "override":
+                    self[key] = value
+                elif strategy == "keep":
+                    if key not in self:
+                        self[key] = value
+                elif isinstance(self._data.get(key), ConfigNode) and isinstance(value, dict):
+                    self[key] = self._deep_merge_dicts(self._data[key].to_dict(), value)
                 else:
-                    self.set(key, value)
-            else:
-                raise ConfigValidationError(f"未知的合并策略: {strategy}，支持 'override'、'keep'、'deep'")
-
+                    self[key] = value
+        self._warn_shadowed()
         return self
 
-    def _deep_merge_dicts(self, dict1: Dict[str, Any], dict2: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        深度合并两个字典。
-        :param dict1: 第一个字典
-        :param dict2: 第二个字典
-        :return: 合并后的字典
-        """
+    @staticmethod
+    def _deep_merge_dicts(
+        dict1: Dict[str, Any], dict2: Dict[str, Any]
+    ) -> Dict[str, Any]:
         result = dict1.copy()
         for key, value in dict2.items():
             if key in result and isinstance(result[key], dict) and isinstance(value, dict):
-                result[key] = self._deep_merge_dicts(result[key], value)
+                result[key] = Config._deep_merge_dicts(result[key], value)
             else:
                 result[key] = value
         return result
 
     def diff(self, other: Union[Dict[str, Any], "Config"]) -> Dict[str, Any]:
-        """
-        比较两个配置的差异。
-        :param other: 要比较的 dict 或 Config 对象
-        :return: 差异字典，包含 'added'、'removed'、'modified' 三个键
-        """
+        """比较差异，返回 {'added': ..., 'removed': ..., 'modified': ...}。"""
         if isinstance(other, Config):
             other_data = other.to_dict()
         elif isinstance(other, dict):
             other_data = other
         else:
-            raise ConfigValidationError(f"不支持的类型: {type(other)}，期望 dict 或 Config")
+            raise ConfigValidationError(
+                f"不支持的类型: {type(other)}，期望 dict 或 Config"
+            )
+        return self._diff_dicts(self.to_dict(), other_data)
 
-        current = self.to_dict()
-        return self._diff_dicts(current, other_data)
+    def _diff_dicts(
+        self, dict1: Dict[str, Any], dict2: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        added: Dict[str, Any] = {}
+        removed: Dict[str, Any] = {}
+        modified: Dict[str, Any] = {}
 
-    def _diff_dicts(self, dict1: Dict[str, Any], dict2: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        递归比较两个字典的差异。
-        :param dict1: 第一个字典
-        :param dict2: 第二个字典
-        :return: 差异字典
-        """
-        added = {}
-        removed = {}
-        modified = {}
-
-        # 检查 dict2 中存在但 dict1 中不存在的键
-        for key in dict2:
+        for key, value in dict2.items():
             if key not in dict1:
-                added[key] = dict2[key]
-            elif isinstance(dict1[key], dict) and isinstance(dict2[key], dict):
-                # 递归比较嵌套字典
-                nested_diff = self._diff_dicts(dict1[key], dict2[key])
-                if nested_diff["added"]:
-                    added.setdefault(key, {}).update(nested_diff["added"])
-                if nested_diff["removed"]:
-                    removed.setdefault(key, {}).update(nested_diff["removed"])
-                if nested_diff["modified"]:
-                    modified.setdefault(key, {}).update(nested_diff["modified"])
-            elif dict1[key] != dict2[key]:
-                modified[key] = {"old": dict1[key], "new": dict2[key]}
+                added[key] = value
+            elif isinstance(dict1[key], dict) and isinstance(value, dict):
+                nested = self._diff_dicts(dict1[key], value)
+                if nested["added"]:
+                    added.setdefault(key, {}).update(nested["added"])
+                if nested["removed"]:
+                    removed.setdefault(key, {}).update(nested["removed"])
+                if nested["modified"]:
+                    modified.setdefault(key, {}).update(nested["modified"])
+            elif dict1[key] != value:
+                modified[key] = {"old": dict1[key], "new": value}
 
-        # 检查 dict1 中存在但 dict2 中不存在的键
-        for key in dict1:
+        for key, value in dict1.items():
             if key not in dict2:
-                removed[key] = dict1[key]
+                removed[key] = value
 
         return {"added": added, "removed": removed, "modified": modified}
 
-    def to_env(self, prefix: str = "", uppercase: bool = True) -> Dict[str, str]:
+    # ------------------------------------------------------------------
+    # 环境变量
+    # ------------------------------------------------------------------
+    def to_env(
+        self, prefix: str = "", uppercase: bool = True, separator: str = "__"
+    ) -> Dict[str, str]:
+        """导出为环境变量格式。
+
+        前缀用单个下划线衔接（``APP_HOST``，符合惯例），嵌套层级用 ``separator``
+        （默认双下划线）衔接（``APP_DB__HOST``）。这样 ``from_env`` 才能无歧义地还原：
+        单下划线在环境变量里太常见，``APP_APP_NAME`` 既可能是前缀+扁平键，
+        也可能是两层嵌套，只有双下划线能区分。
         """
-        将配置导出为环境变量格式。
-        :param prefix: 环境变量前缀
-        :param uppercase: 是否转换为大写
-        :return: 环境变量字典
-        """
-        result = {}
-        self._flatten_to_env(self._data.data, prefix, uppercase, result)
+        prefix = prefix.rstrip("_")
+        result: Dict[str, str] = {}
+        for path, value in self._walk_leaves():
+            name = "_".join(part for part in (prefix, separator.join(path)) if part)
+            result[name.upper() if uppercase else name] = str(value)
         return result
 
-    def _flatten_to_env(self, data: Dict[str, Any], prefix: str, uppercase: bool, result: Dict[str, str]) -> None:
-        """
-        递归展平字典为环境变量格式。
-        """
-        for key, value in data.items():
-            env_key = f"{prefix}_{key}" if prefix else key
-            if uppercase:
-                env_key = env_key.upper()
-            if isinstance(value, dict):
-                self._flatten_to_env(value, env_key, uppercase, result)
+    def _walk_leaves(
+        self, node: Optional[Dict[str, Any]] = None, path: Tuple[str, ...] = ()
+    ):
+        if node is None:
+            node = self._data
+        for key, value in node.items():
+            sub_path = path + (key,)
+            if isinstance(value, ConfigNode):
+                yield from self._walk_leaves(value._data, sub_path)
+            elif isinstance(value, dict):
+                yield from self._walk_leaves(value, sub_path)
             else:
-                result[env_key] = str(value)
+                yield sub_path, value
 
-    def from_env(self, prefix: str = "", separator: str = "_") -> "Config":
+    def from_env(self, prefix: str = "", separator: str = "__") -> "Config":
+        """导入环境变量（去前缀、转小写，``separator`` 还原为嵌套路径）。
+
+        与 ``to_env`` 互逆：``APP_DB__HOST`` 还原成 ``db.host``，``APP_NAME`` 还原成扁平键 ``name``。
         """
-        从环境变量导入配置。
-        :param prefix: 环境变量前缀（只导入以此开头的变量）
-        :param separator: 嵌套路径分隔符
-        :return: self，支持链式操作
-        """
-        for key, value in os.environ.items():
-            if prefix and not key.startswith(prefix):
-                continue
-            # 移除前缀
-            config_key = key[len(prefix):].lstrip(separator) if prefix else key
-            # 转换为小写
-            config_key = config_key.lower()
-            # 使用分隔符构建嵌套路径
-            if separator in config_key:
-                self.set(config_key, value, overwrite_mode=True)
-            else:
-                self.set(config_key, value)
+        prefix = prefix.rstrip("_")
+        with self._deferred():
+            for env_key, value in os.environ.items():
+                if prefix and not env_key.startswith(prefix):
+                    continue
+                config_key = env_key[len(prefix):].lstrip("_") if prefix else env_key
+                config_key = config_key.lower()
+                if separator:
+                    config_key = config_key.replace(separator, ".")
+                self[config_key] = value
+        self._warn_shadowed()
         return self
 
-    def del_key(self, key):
-        """
-        删除指定配置项，支持点号路径，并会自动清理空的父节点。
-        :param key: 配置项路径
-        """
-        keys = key.split('.')
-        if not keys:
-            return
+    # ------------------------------------------------------------------
+    # 批量写入上下文
+    # ------------------------------------------------------------------
+    @contextmanager
+    def _deferred(self):
+        """暂停自动落盘，退出时统一保存一次。"""
+        self._defer += 1
+        try:
+            yield
+        finally:
+            self._defer -= 1
+            if self._defer == 0 and self._dirty and self._auto_save:
+                self._auto_save_if_needed()
 
-        # 使用一个栈来追踪访问路径，(ConfigNode, 键)
-        path_stack = []
-        node = self._data
+    @contextmanager
+    def _unvalidated(self):
+        """加载磁盘内容时不套用 schema：文件内容不该让构造函数直接失败。"""
+        previous, self._validating = self._validating, False
+        try:
+            yield
+        finally:
+            self._validating = previous
 
-        # 导航到目标位置
-        for k in keys[:-1]:
-            if isinstance(node, ConfigNode) and k in node.data:
-                path_stack.append((node, k))
-                node = node.data[k]
-                # 如果节点是 dict，需要包装为 ConfigNode
-                if isinstance(node, dict):
-                    node = ConfigNode(node, manager=self, parent=path_stack[-1][0], key_in_parent=k)
-                    path_stack[-1][0].data[k] = node
-            else:
-                # 路径不存在，无需删除
+    @contextmanager
+    def transaction(self, rollback_on_error: bool = True):
+        """批量写入上下文：块内不落盘，正常退出时统一写一次盘。
+
+        块内抛异常时默认把内存回滚到进入前的状态，并且不写盘——
+        保证的是「半途而废的修改不会进文件」，不是跨进程事务（写盘本身已是原子替换）。
+        传 ``rollback_on_error=False`` 可以退回「异常也照样把已有改动落盘」的行为。
+        """
+        snapshot = self._expand() if rollback_on_error else None
+        was_dirty = self._dirty
+        failed = False
+        self._defer += 1
+        try:
+            yield self
+        except BaseException:
+            failed = True
+            raise
+        finally:
+            self._defer -= 1
+            if failed and snapshot is not None:
+                self._defer += 1
+                try:
+                    with self._unvalidated():
+                        self._replace(snapshot)
+                except Exception:  # 回滚失败不能盖住用户的异常
+                    logger.warning("事务回滚失败，内存保持当前值。")
+                finally:
+                    self._defer -= 1
+                self._dirty = was_dirty
+            elif self._defer == 0 and self._dirty and self._auto_save:
+                self._auto_save_if_needed()
+
+    def validate(self) -> None:
+        """按 schema 检查当前全部配置值，包括从文件加载进来的部分。"""
+        previous, self._validating = self._validating, True
+        try:
+            for path, value in self._walk_leaves():
+                self._validate_write(".".join(path), value)
+        finally:
+            self._validating = previous
+
+    # ------------------------------------------------------------------
+    # 加载 / 保存
+    # ------------------------------------------------------------------
+    def _load(self) -> None:
+        """从文件加载配置。磁盘内容不受 schema 约束（要检查请显式调用 ``validate()``）。"""
+        with self._unvalidated(), self._lock, self._process_lock(shared=True):
+            with self._file_path.open("rb") as f:
+                raw_data = f.read()
+
+            if not raw_data:
+                self._replace({})
+                self._dirty = False
+                self._last_saved_mtime = self._file_mtime()
                 return
 
-        # 删除最后一个键
-        final_key = keys[-1]
-        if isinstance(node, ConfigNode) and final_key in node.data:
-            del node[final_key]
+            if raw_data.startswith(ENCRYPT_HEADER):
+                if not self._pwd:
+                    raise ConfigEncryptionError("此文件为加密文件，请提供密码")
+                loaded = self._decrypt_data(raw_data)
+            else:
+                read_mode = "r" + self._handler.mode
+                encoding = "utf-8" if "b" not in read_mode else None
+                with self._file_path.open(read_mode, encoding=encoding) as f2:
+                    loaded = self._handler.load(f2)
 
-            # 回溯并清理空的父节点
-            while path_stack:
-                parent_node, parent_key = path_stack.pop()
-                child_node = parent_node.data.get(parent_key)
-                if isinstance(child_node, ConfigNode) and not child_node.data:
-                    del parent_node[parent_key]
-                else:
-                    # 如果子节点非空，则停止回溯
-                    break
+            if not isinstance(loaded, dict):
+                raise ConfigValidationError(
+                    f"{self._file_path} 的内容不是键值结构（得到 {type(loaded).__name__}），"
+                    f"无法作为 {self._way} 配置加载。"
+                )
+            self._replace(loaded)
+            self._dirty = False
+            self._last_saved_mtime = self._file_mtime()
 
-    def _load(self):
-        """从文件加载配置。"""
-        with self._lock, self._process_lock(shared=True):
-            try:
-                # 统一用二进制模式预读，以判断是否加密
-                with self._file_path.open('rb') as f:
-                    raw_data = f.read()
-
-                # 如果文件为空，则初始化为空配置
-                if not raw_data:
-                    self._data = ConfigNode({}, manager=self)
-                    return
-
-                # 判断加密头
-                if raw_data.startswith(ENCRYPT_HEADER):
-                    if not self._pwd:
-                        raise ConfigEncryptionError("此文件为加密文件，请提供密码")
-                    # _decrypt_data 会在失败时抛出异常
-                    decrypted_data = self._decrypt_data(raw_data)
-                    self._data = ConfigNode(decrypted_data, manager=self)
-                else:
-                    # 对于明文文件，根据 handler 的模式选择正确的读写方式
-                    read_mode = 'r' + self._handler.mode
-                    encoding = 'utf-8' if 'b' not in read_mode else None
-                    with self._file_path.open(read_mode, encoding=encoding) as f2:
-                        loaded_data = self._handler.load(f2)
-                    self._data = ConfigNode(loaded_data, manager=self)
-
-            except FileNotFoundError:
-                # 文件不存在是正常情况，将在首次保存时创建。
-                # 初始化为空数据，以避免后续操作出错。
-                self._data = ConfigNode({}, manager=self)
-            # 其他所有异常（如解密失败、解析错误）都将正常抛出，不再被静默处理。
-
-    def _load_env_config(self, env: str):
-        """
-        加载环境特定配置文件（如 app.dev.toml）。
-        :param env: 环境名称
-        """
-        # 构建环境配置文件路径：app.toml -> app.dev.toml
-        env_file = self._file_path.with_stem(f"{self._file_path.stem}.{env}")
-        
-        if not env_file.exists():
-            logger.debug(f"环境配置文件不存在: {env_file}")
-            return
-        
+    def _file_mtime(self) -> Optional[int]:
         try:
-            # 读取环境配置文件
+            return self._file_path.stat().st_mtime_ns
+        except OSError:
+            return None
+
+    def _changed_on_disk(self) -> bool:
+        """磁盘内容与内存是否已经不一致（用于区分自己写盘和外部修改）。"""
+        current = self._file_mtime()
+        return current is None or current != self._last_saved_mtime
+
+    def _load_env_config(self, env: str) -> None:
+        """加载环境特定配置文件（如 app.dev.toml）并合并。"""
+        env_file = self._file_path.with_name(
+            f"{self._file_path.stem}.{env}{self._file_path.suffix}"
+        )
+        if not env_file.exists():
+            logger.debug("环境配置文件不存在: %s", env_file)
+            return
+
+        try:
             with self._lock, self._process_lock(shared=True):
-                with env_file.open('rb') as f:
-                    raw_data = f.read()
-                
+                raw_data = env_file.read_bytes()
                 if not raw_data:
                     return
-                
-                # 判断是否加密
                 if raw_data.startswith(ENCRYPT_HEADER):
                     if not self._pwd:
-                        raise ConfigEncryptionError(f"环境配置文件 {env_file} 为加密文件，请提供密码")
+                        raise ConfigEncryptionError(
+                            f"环境配置文件 {env_file} 为加密文件，请提供密码"
+                        )
                     env_data = self._decrypt_data(raw_data)
                 else:
-                    read_mode = 'r' + self._handler.mode
-                    encoding = 'utf-8' if 'b' not in read_mode else None
+                    read_mode = "r" + self._handler.mode
+                    encoding = "utf-8" if "b" not in read_mode else None
                     with env_file.open(read_mode, encoding=encoding) as f2:
                         env_data = self._handler.load(f2)
-                
-                # 使用 update 方法合并配置（支持深度合并）
                 self.update(env_data)
-                logger.info(f"已加载环境配置: {env_file}")
-                
-        except Exception as e:
-            logger.error(f"加载环境配置文件失败 {env_file}: {e}")
-            raise ConfigIOError(f"加载环境配置文件失败 {env_file}: {e}") from e
+                logger.info("已加载环境配置: %s", env_file)
+        except ConfigError:
+            raise
+        except Exception as exc:
+            raise ConfigIOError(f"加载环境配置文件失败 {env_file}: {exc}") from exc
 
-    def reload(self):
-        """
-        从磁盘重新加载配置文件。
-        注意：这将丢弃所有未保存的更改。
-        """
+    def reload(self) -> None:
+        """从磁盘重新加载，丢弃所有未保存的更改。"""
         self._load()
-        self._dirty = False
-        logger.info(f"配置已从 {self._file_path} 重新加载。")
+        logger.info("配置已从 %s 重新加载。", self._file_path)
 
-    def load(self, file=None, way=None):
-        """
-        切换配置文件或格式（不自动加载内容）。
-        :param file: 新文件名
-        :param way: 新格式
-        """
+    def load(self, file: Union[str, os.PathLike, None] = None, way: Optional[str] = None) -> None:
+        """切换目标文件或格式（不读取内容；要立即生效请用 ``reload()``）。"""
         if file:
             self._file_path = Path(file).resolve()
         if way:
-            self._way = way.lower()
+            self._way = self._validate_format(way)
             self._handler = ConfigHandlerFactory.get_handler(self._way)
 
-    def mark_dirty(self):
+    def mark_dirty(self) -> None:
         """标记配置已更改。"""
         self._dirty = True
 
-    # ------------------------------------------------------------------
-    # 供 ConfigNode 调用的友元接口
-    # ------------------------------------------------------------------
-    def notify_dirty(self):
-        """由子节点在数据变动时调用，包装锁与自动保存逻辑。"""
+    def notify_dirty(self) -> None:
+        """由节点在数据变动时调用。"""
         with self._lock:
-            self.mark_dirty()
-            if self._auto_save:
-                self._auto_save_if_needed()
+            self._dirty = True
+            if self._defer or not self._auto_save:
+                return
+            self._auto_save_if_needed()
 
-    # 内部：自动保存
-    def _auto_save_if_needed(self):
+    def _auto_save_if_needed(self) -> None:
         if not self._auto_save:
             return
-
         if self._debounce_ms == 0:
             self.save()
             return
-
-        # 启动 / 重置计时器
         if self._save_timer and self._save_timer.is_alive():
             self._save_timer.cancel()
-
         self._save_timer = threading.Timer(self._debounce_ms / 1000, self._flush_save)
         self._save_timer.daemon = True
         self._save_timer.start()
 
-    # -------------------- 异步保存实现 --------------------
-    def _flush_save(self):
-        """计时器回调：真正执行保存"""
-        try:
-            self.save()
-        finally:
-            self._save_timer = None
+    def _flush_save(self) -> None:
+        if self._save_timer and self._save_timer.is_alive():
+            self._save_timer.cancel()
+        self._save_timer = None
+        self.save()
 
-    def save(self):
-        """保存配置到文件。"""
-        # 若有计时器等待，先取消，改为立即保存
+    def save(self) -> None:
+        """立即保存到文件（忽略去抖延迟）。"""
         if self._save_timer and self._save_timer.is_alive():
             self._save_timer.cancel()
             self._save_timer = None
@@ -755,379 +680,252 @@ class Config:
             if not self._dirty:
                 return
             try:
-                # 写入前校验：如果文件存在且为加密文件，进行校验
-                if self._file_path.exists():
-                    with self._file_path.open('rb') as f:
-                        # 只读取头部来判断是否加密，避免读取整个大文件
-                        header = f.read(len(ENCRYPT_HEADER))
-                        if header == ENCRYPT_HEADER:
-                            f.seek(0)  # 重置文件指针
-                            raw_content = f.read()
-                            try:
-                                # 复用解密逻辑进行校验，如果失败会抛出异常
-                                self._decrypt_data(raw_content)
-                            except Exception as e:
-                                raise ConfigEncryptionError(f'加密文件校验失败，拒绝写入！原因：{e}')
+                if self._pwd and self._file_path.exists():
+                    # 写前校验：既有文件若已是加密格式，必须仍能用当前密码解开，否则拒绝覆盖。
+                    # 明文文件则放行，这正是「给既有明文配置加密码」的路径。
+                    raw = self._file_path.read_bytes()
+                    if raw.startswith(ENCRYPT_HEADER):
+                        self._decrypt_data(raw)
 
                 self._write_to_file(self._file_path, self._way)
                 self._dirty = False
-                # 保存完成后清理锁文件，避免残留 .lock 文件
+                self._last_saved_mtime = self._file_mtime()
                 self._cleanup_lock_file()
-            except Exception as e:
-                logger.error("保存配置文件失败 %s: %s", self._file_path, e)
-                # 保持脏标记，以便后续重试
+            except ConfigError:
                 self._dirty = True
-                # 重新抛出异常，让调用方知道保存失败
-                raise ConfigIOError(f"保存配置文件失败 {self._file_path}: {e}") from e
+                raise
+            except Exception as exc:
+                self._dirty = True
+                logger.error("保存配置文件失败 %s: %s", self._file_path, exc)
+                raise ConfigIOError(f"保存配置文件失败 {self._file_path}: {exc}") from exc
 
-    def to_file(self, file=None, way=None):
-        """
-        另存为指定文件和格式。
-        :param file: 目标文件
-        :param way: 目标格式
-        """
-        target_file = self.ensure_extension(Path(file)) if file else self._file_path
-        target_way = self.validate_format(way) if way else self._way
+    def to_file(
+        self,
+        file: Union[str, os.PathLike, None] = None,
+        way: Optional[str] = None,
+    ) -> None:
+        """另存为指定文件和/或格式。"""
+        target_file = self._ensure_extension(Path(file)) if file else self._file_path
+        target_way = self._validate_format(way) if way else self._way
         with self._lock:
             self._write_to_file(target_file, target_way)
-            # 另存完成后也尝试清理锁文件
             self._cleanup_lock_file()
-        logger.info(f"配置已成功另存到 {target_file}")
+        logger.info("配置已成功另存到 %s", target_file)
 
-    def _write_to_file(self, target_file: Path, target_way):
-        """
-        将配置数据写入指定文件和格式的核心逻辑。
-        :param target_file: 目标文件路径 (Path object)
-        :param target_way: 目标文件格式
-        """
+    def _write_to_file(self, target_file: Path, target_way: str) -> None:
+        """写入指定文件和格式的核心逻辑：临时文件 + 原子替换。"""
         target_handler = ConfigHandlerFactory.get_handler(target_way)
         self._ensure_file_exists(file_path=target_file)
 
-        # 临时文件
         temp_path = target_file.with_name(f"{target_file.name}.tmp")
         try:
             with self._process_lock(shared=False):
-                config_data = self._data.dict
+                config_data = self._expand()
 
-                # 1. 写入临时文件
                 if self._pwd:
-                    encrypted_data = self._encrypt_data(config_data)
-                    with temp_path.open('wb') as f:
-                        f.write(encrypted_data)
-                        f.flush()
-                        os.fsync(f.fileno())
+                    temp_path.write_bytes(self._encrypt_data(config_data))
                 else:
-                    mode = 'w' + target_handler.mode
-                    encoding = 'utf-8' if 'b' not in mode else None
+                    mode = "w" + target_handler.mode
+                    encoding = "utf-8" if "b" not in mode else None
                     with temp_path.open(mode, encoding=encoding) as f:
                         target_handler.save(config_data, f)
                         f.flush()
                         os.fsync(f.fileno())
 
-                # 2. 原子替换
-                # Path.replace 在 Windows 3.8+ 也支持原子替换（调用 MoveFileEx）
                 temp_path.replace(target_file)
-
-        except Exception as e:
-            # 清理残留的临时文件
+        except Exception as exc:
             try:
-                if temp_path.exists():
-                    temp_path.unlink()
+                temp_path.unlink(missing_ok=True)
             except OSError:
                 pass
-            # 重新抛出异常，让调用方处理
-            raise ConfigIOError(f"写入文件 {target_file} 失败: {e}") from e
+            raise ConfigIOError(f"写入文件 {target_file} 失败: {exc}") from exc
 
-    def _ensure_file_exists(self, file_path: Optional[Path] = None):
-        """确保配置文件存在。"""
+    def _ensure_file_exists(self, file_path: Optional[Path] = None) -> None:
         path = file_path or self._file_path
         if not path.exists():
             try:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.touch()
-            except OSError as e:
-                raise ConfigIOError(f"创建文件 {path} 失败: {e}") from e
+            except OSError as exc:
+                raise ConfigIOError(f"创建文件 {path} 失败: {exc}") from exc
 
-    def _recursive_update(self, original, new_data):
-        """
-        递归更新配置，支持点号路径。
-        :param original: 原始 dict
-        :param new_data: 新数据 dict
-        """
-        for key, value in new_data.items():
-            if '.' in key:
-                keys = key.split('.')
-                current = original
-                for k in keys[:-1]:
-                    current = current.setdefault(k, {})
-                current[keys[-1]] = value
-            elif isinstance(value, dict) and isinstance(original.get(key, None), dict):
-                self._recursive_update(original[key], value)
-            else:
-                if original.get(key) != value:
-                    original[key] = value
-                    self.mark_dirty()
+    def del_clean(self) -> bool:
+        """清空所有配置并删除配置文件。"""
+        with self._lock:
+            if not self._file_path.exists():
+                return False
+            try:
+                self._file_path.unlink()
+            except OSError as exc:
+                logger.warning("清除配置文件 %s 失败：%s", self._file_path, exc)
+                return False
+            if self._process_safe:
+                lock_path = self._lock_path()
+                if lock_path.exists():
+                    try:
+                        lock_path.unlink()
+                    except OSError:
+                        pass
+            self._replace({})
+            self._dirty = False
+            return True
 
+    # ------------------------------------------------------------------
+    # 加密
+    # ------------------------------------------------------------------
+    def _derive_fernet(self, salt: bytes):
+        from cryptography.fernet import Fernet
+        from cryptography.hazmat.primitives.hashes import SHA256
+        from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+
+        assert self._pwd is not None
+        kdf = PBKDF2HMAC(
+            algorithm=SHA256(), length=32, salt=salt, iterations=PBKDF2_ITERATIONS
+        )
+        key = _b64.urlsafe_b64encode(kdf.derive(self._pwd.encode()))
+        return Fernet(key)
+
+    def _fernet_for(self, salt: bytes):
+        """同一个 (密码, salt) 只派生一次密钥；自动保存因此不再是每次赋值都跑一遍 PBKDF2。"""
+        if (
+            self._fernet is None
+            or self._salt != salt
+            or self._fernet_pwd != self._pwd
+        ):
+            self._fernet = self._derive_fernet(salt)
+            self._salt = salt
+            self._fernet_pwd = self._pwd
+        return self._fernet
+
+    def _encrypt_data(self, data: Dict[str, Any]) -> bytes:
+        """使用 Fernet(AES128 + HMAC) 加密配置数据。"""
+        if not self._pwd:
+            raise ConfigEncryptionError("加密需要提供密码。")
+        if self._salt is None:
+            self._salt = os.urandom(SALT_SIZE)
+        cipher = self._fernet_for(self._salt)
+        return ENCRYPT_HEADER + self._salt + cipher.encrypt(orjson.dumps(data))
+
+    def _decrypt_data(self, encrypted_data: bytes) -> Dict[str, Any]:
+        """解密 Fernet 数据；密码错误或内容被篡改时抛 ``ConfigEncryptionError``。"""
+        if not self._pwd:
+            raise ConfigEncryptionError("解密时需要提供密码。")
+        if not encrypted_data.startswith(ENCRYPT_HEADER):
+            # 明文文件（例如加密配置被外部编辑器重写），原样交给上层解析
+            raise ConfigEncryptionError("数据缺少加密头，无法解密。")
+
+        from cryptography.fernet import InvalidToken
+
+        blob = encrypted_data[len(ENCRYPT_HEADER):]
+        salt, ciphertext = blob[:SALT_SIZE], blob[SALT_SIZE:]
+        try:
+            cipher = self._fernet_for(salt)
+            return orjson.loads(cipher.decrypt(ciphertext))
+        except InvalidToken:
+            raise ConfigEncryptionError("校验失败：密码错误或数据损坏")
+        except ConfigEncryptionError:
+            raise
+        except Exception as exc:
+            raise ConfigEncryptionError(f"解密失败: {exc}") from exc
+
+    # ------------------------------------------------------------------
+    # 格式工具
+    # ------------------------------------------------------------------
     @staticmethod
-    def validate_format(_way):
+    def _validate_format(_way) -> str:
         """校验并返回合法格式名，接受 str 或 Format。"""
         if isinstance(_way, Format):
             return _way.value
         return Format.from_str(str(_way)).value
 
-    def ensure_extension(self, path: Path) -> Path:
-        """确保文件名有正确扩展名，并创建必要的目录。"""
-        # 创建目录（如果有）
+    def _ensure_extension(self, path: Path) -> Path:
+        """确保文件有正确扩展名，并创建必要目录。"""
         if path.parent and not path.parent.exists():
             try:
                 path.parent.mkdir(parents=True, exist_ok=True)
-            except OSError as e:
-                raise ConfigIOError(f"创建目录 {path.parent} 失败: {e}") from e
-
-        # 添加扩展名
+            except OSError as exc:
+                raise ConfigIOError(f"创建目录 {path.parent} 失败: {exc}") from exc
         if path.suffix == "":
             path = path.with_suffix(f".{self._way}")
         return path
 
-    def __getattr__(self, item):
-        """属性访问代理到配置数据，优先访问配置键。"""
-        # 优先在配置字典中查找 `item`，以解决配置键与内部属性（如 'data'）的命名冲突。
-        # 使用 has_top_level_key 方法安全地检查键是否存在，避免直接访问受保护成员。
-        if self._data.has_top_level_key(item):
-            # 使用 __getitem__ 来获取值，它能正确处理嵌套并返回节点或值。
-            return self._data[item]
-
-        # 如果不是配置键，则假定它是 ConfigNode 上的一个方法或属性。
-        return getattr(self._data, item)
-
-    def __getitem__(self, item):
-        """dict 方式访问配置数据，支持点路径。"""
-        keys = item.split('.')
-        node = self
-        for k in keys:
-            # Here, `node` can be `Config` or `ConfigNode`
-            if isinstance(node, (Config, ConfigNode)):
-                try:
-                    node = node._data[k]
-                except KeyError:
-                    # To align with getattr behavior, allow autovivification on read
-                    # This is a bit controversial, but makes access consistent.
-                    # Let's see if tests pass. For now, raise.
-                    raise ConfigValidationError(
-                        f"路径 '{item}' 不存在。"
-                        f"提示：可使用 get('{item}', default) 提供默认值，"
-                        f"或使用 set('{item}', value) 创建该配置项。"
-                    )
-            elif isinstance(node, dict):
-                node = node.get(k)
-                if node is None:
-                    raise ConfigValidationError(
-                        f"路径 '{item}' 不存在。"
-                        f"提示：可使用 get('{item}', default) 提供默认值，"
-                        f"或使用 set('{item}', value) 创建该配置项。"
-                    )
-            else:
-                raise ConfigValidationError(
-                    f"路径 '{item}' 不存在。"
-                    f"提示：可使用 get('{item}', default) 提供默认值，"
-                    f"或使用 set('{item}', value) 创建该配置项。"
-                )
-
-        if isinstance(node, dict):
-            return ConfigNode(node, manager=self)
-        return node
-
-    def __call__(self, key, value=None):
-        """cc(key) 等价于 cc.get(key, value)"""
-        return self.get(key, value)
-
-    def __len__(self):
-        """配置项数量。"""
-        return len(self._data)
-
-    def __iter__(self):
-        """遍历配置项。"""
-        return iter(self._data)
-
-    def __contains__(self, item):
-        """判断配置项是否存在，支持点路径。"""
-        sentinel = object()
-        return self.get(item, sentinel) is not sentinel
-
-    def __bool__(self):
-        """配置是否非空。"""
-        return bool(self._data)
-
-    def __enter__(self):
-        """上下文管理器 enter。"""
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """上下文管理器 exit，自动保存。"""
-        self.save()
-
-    _CONF_RESERVED = {
-        "to_dict", "to_json", "is_auto_save", "set_auto_save",
-        "path", "path_abs", "save", "to_file", "reload", "set", "get", "del_clean",
-        "opt",  # Add opt to reserved
-    }
-
-    def _conf_check_reserved(self, key: str):
-        """检查顶层键是否为保留关键字。若是则抛出异常。"""
-        if key in self._CONF_RESERVED:
-            raise ConfigValidationError(f"关键字 '{key}' 为保留接口名称，禁止覆盖。请使用其他名称。")
-
-    def _validate_type(self, key: str, value: Any):
-        """
-        验证配置值类型是否符合 schema。
-        :param key: 配置项路径（支持点号路径）
-        :param value: 配置值
-        """
-        if not self._schema:
-            return
-        
-        # 检查是否有匹配的 schema 规则
-        expected_type = self._schema.get(key)
-        if expected_type is None:
-            return
-        
-        # 检查类型
-        if not isinstance(value, expected_type):
-            raise ConfigValidationError(
-                f"键 '{key}' 期望类型 {expected_type.__name__}，实际得到 {type(value).__name__}"
-            )
-
-    def __setattr__(self, key, value):
-        if key.startswith('_'):
-            super().__setattr__(key, value)
-        else:
-            # 检查保留关键字
-            self._conf_check_reserved(key)
-            # 类型检查
-            self._validate_type(key, value)
-            setattr(self._data, key, value)
-
-    def __delattr__(self, key):
-        """属性删除代理到配置数据，使其行为与 del_key 一致。"""
-        if key.startswith('_'):
-            super().__delattr__(key)
-        else:
-            # 使用 get 来检查key是否存在，以避免触发__getattr__的自动创建
-            try:
-                self.get(key)
-                # key 存在，可以删除
-                self.del_key(key)
-            except (KeyError, AttributeError, ConfigValidationError):
-                # get 失败会抛出 ConfigValidationError, 如果路径无效则可能 AttributeError
-                raise AttributeError(f"'Config' object has no attribute '{key}'")
-
-    def __setitem__(self, key, value):
-        """
-        实现字典方式赋值
-        """
-        # 类型检查
-        self._validate_type(key, value)
-        keys = key.split('.')
-        node = self._data
-        for k in keys[:-1]:
-            if k not in node.data:
-                node[k] = {}
-            node = node[k]
-        node[keys[-1]] = value
-        # ConfigNode 的 __setitem__ 会触发 _trigger_save，无需重复调用
-
     # ------------------------------------------------------------------
     # 文件变更监控
     # ------------------------------------------------------------------
-    def enable_watch(self):
-        """开启文件变动监听，文件修改后自动 reload。需要安装 'watchdog' 额外依赖。"""
+    def enable_watch(self) -> None:
+        """开启文件变动监听，文件被外部修改后自动 reload。需要 watchdog。"""
         if self._observer:
-            return  # already enabled
+            return
+
+        try:
+            from watchdog.events import FileSystemEventHandler
+            from watchdog.observers import Observer
+        except ImportError as exc:
+            raise ImportError(
+                "文件监听需要 'watchdog'，请先安装：pip install 'confull[watch]'"
+            ) from exc
 
         if sys.version_info >= (3, 13):
             logger.warning(
                 "watchdog 在 Python 3.13+ 可能存在兼容性问题，"
-                "建议升级 watchdog 库或使用 polling 方式监听"
+                "建议升级 watchdog 或使用轮询方式监听"
             )
 
         class _Handler(FileSystemEventHandler):
             def __init__(self, manager: "Config"):
                 self._manager = manager
-                # 预先缓存目标文件的规范化绝对路径，避免频繁构造
                 self._target_path = manager._file_path.resolve()
 
-            def _is_target(self, src_path: Union[str, bytes]) -> bool:
-                """判断事件路径是否为目标文件（跨平台大小写/分隔符兼容）。"""
-                # 确保为 str
+            def _is_target(self, src_path) -> bool:
                 if isinstance(src_path, bytes):
                     try:
-                        src_path = src_path.decode(errors='ignore')
+                        src_path = src_path.decode(errors="ignore")
                     except Exception:
                         return False
                 try:
                     return Path(src_path).resolve() == self._target_path
                 except Exception:
-                    # 回退到字符串粗略比较
                     return str(Path(src_path).absolute()) == str(self._target_path)
 
-            def on_modified(self, event):  # type: ignore
-                if self._is_target(event.src_path):
-                    self._manager.reload()
+            def on_modified(self, event):
+                # 自己写盘也会触发事件：只有 mtime 与上次落盘不一致才说明是外部改动。
+                if self._is_target(event.src_path) and self._manager._changed_on_disk():
+                    self._manager._load()
 
-            # 有些编辑器写文件会触发 moved/created
-            on_created = on_modified  # type: ignore[override]
-            on_moved = on_modified  # type: ignore[override]
+            on_created = on_modified
+            on_moved = on_modified
 
         handler = _Handler(self)
         observer = Observer()
         observer.schedule(handler, self._file_path.parent.as_posix(), recursive=False)
         observer.daemon = True
+        # Observer 本身就是 threading.Thread，直接命名即可，无需占位线程。
+        observer.name = f"DirWatcher-{self._file_path.name}"
         observer.start()
-
-        # 重命名内部线程，方便测试与调试 (tests rely on "DirWatcher" 前缀)
-        try:
-            thr = (
-                    getattr(observer, "_thread", None)
-                    or getattr(observer, "_observer_thread", None)
-                    or getattr(observer, "thread", None)
-            )
-            if isinstance(thr, threading.Thread):
-                thr.name = f"DirWatcher-{id(self)}"
-            else:
-                raise AttributeError("observer thread not found")
-        except AttributeError:
-            # 若 watchdog 内部实现变动导致无法命名，启动一个占位线程，供测试/调试识别
-            self._watch_dummy_stop = threading.Event()
-            dummy = threading.Thread(
-                target=self._watch_dummy_stop.wait,
-                name=f"DirWatcher-{id(self)}",
-                daemon=True,
-            )
-            dummy.start()
-            self._watch_dummy_thread = dummy
-
         self._observer = observer
 
-    def disable_watch(self):
+    def disable_watch(self) -> None:
         """关闭文件监听。"""
         if self._observer:
             self._observer.stop()
             self._observer.join(timeout=1)
             self._observer = None
 
-        # 停止占位线程（若有）
-        if self._watch_dummy_stop is not None:
-            self._watch_dummy_stop.set()
-            if self._watch_dummy_thread and self._watch_dummy_thread.is_alive():
-                self._watch_dummy_thread.join(timeout=1)
-
-    # 确保对象销毁时停止 observer
     def __del__(self):
-        # noinspection PyBroadException
         try:
             self.disable_watch()
         except Exception:
             pass
+
+    # ------------------------------------------------------------------
+    # 上下文管理器
+    # ------------------------------------------------------------------
+    def __enter__(self) -> "Config":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        """退出时自动保存。"""
+        self.save()
 
     # ------------------------------------------------------------------
     # 进程锁
@@ -1142,19 +940,21 @@ class Config:
             yield
             return
 
+        try:
+            import portalocker
+        except ImportError as exc:
+            raise ImportError(
+                "process_safe 需要 'portalocker'，请先安装：pip install 'confull[process]'"
+            ) from exc
+
         lock_flags = portalocker.LOCK_SH if shared else portalocker.LOCK_EX
-        # 使用锁文件而非目标文件，避免某些编辑器先删除再写导致锁失效
         lock_path = self._lock_path()
         if not lock_path.exists():
             lock_path.touch()
         with portalocker.Lock(str(lock_path), flags=lock_flags):
             yield
 
-    # ------------------------------------------------------------------
-    # 锁文件清理
-    # ------------------------------------------------------------------
-    def _cleanup_lock_file(self):
-        """在保存操作后尝试删除锁文件，防止目录中遗留 .lock 文件。"""
+    def _cleanup_lock_file(self) -> None:
         if not self._process_safe:
             return
         lock_path = self._lock_path()
@@ -1162,9 +962,5 @@ class Config:
             if lock_path.exists():
                 lock_path.unlink()
         except OSError:
-            # 在某些平台上如果文件仍被占用，删除可能失败，忽略即可
+            # 文件仍被占用时删除会失败，忽略即可
             pass
-
-
-if __name__ == "__main__":
-    pass
